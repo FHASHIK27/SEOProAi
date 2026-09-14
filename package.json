@@ -1,0 +1,21 @@
+{
+  "name": "seopro-ai",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "SEO Service Provider - static frontend + Vercel serverless API + Supabase-ready data layer",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "minify": "node scripts/build.mjs",
+    "start": "node dev-server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "nodemailer": "^10.0.0"
+  },
+  "devDependencies": {
+    "terser": "^5.31.0"
+  }
+}
