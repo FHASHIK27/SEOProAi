@@ -23,12 +23,18 @@ function clientIp(req) {
   return req.socket.remoteAddress || 'unknown'
 }
 
-function originAllowed(origin) {
+function originAllowed(origin, selfHost) {
   if (!origin) return true
   let host = ''
   try { host = new URL(origin).hostname.toLowerCase() } catch (e) { return false }
   if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true
   if (host === 'monkeycode-ai.live' || /\.monkeycode-ai\.live$/i.test(host)) return true
+  // Vercel previews/production: allow the site to call its own /api (same origin).
+  if (host === 'vercel.app' || /\.vercel\.app$/i.test(host)) return true
+  if (selfHost) {
+    const sh = String(selfHost).toLowerCase().replace(/:\d+$/, '')
+    if (sh && host === sh) return true
+  }
   return ALLOWED_ORIGINS.some(a => {
     const h = a.replace(/^https?:\/\//i, '').replace(/^\./, '').split('/')[0].toLowerCase()
     return h && (host === h || host.endsWith('.' + h))
@@ -48,7 +54,7 @@ app.use((req, res, next) => {
 // Reject cross-site browser calls from unknown origins (anti-CSRF / anti-hotlink).
 app.use((req, res, next) => {
   const origin = req.headers.origin
-  if (origin && !originAllowed(origin)) {
+  if (origin && !originAllowed(origin, req.headers.host)) {
     return res.status(403).json({ status: 'Error', error: 'Request origin is not allowed.', compliance })
   }
   next()
