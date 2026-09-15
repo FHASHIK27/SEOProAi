@@ -55,19 +55,18 @@ setInterval(() => {
 
 function securityHeaders(res) {
   res.setHeader('X-Content-Type-Options', 'nosniff')
-  res.setHeader('X-Frame-Options', 'DENY')
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin')
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
   res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()')
   res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains')
   res.setHeader('Content-Security-Policy', [
     "default-src 'self'",
-    "script-src 'self' 'unsafe-inline'",
+    "script-src 'self' 'unsafe-inline' https://esm.sh",
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com",
     "img-src 'self' data:",
-    "connect-src 'self' http://localhost:4000 http://127.0.0.1:4000 https://*.monkeycode-ai.live",
-    "frame-ancestors 'none'",
+    "connect-src 'self' http://localhost:4000 http://127.0.0.1:4000 https://*.monkeycode-ai.live https://*.supabase.co wss://*.supabase.co https://esm.sh",
+    "frame-ancestors 'self' https://*.monkeycode-ai.live",
     "base-uri 'self'",
     "form-action 'self'"
   ].join('; '))
