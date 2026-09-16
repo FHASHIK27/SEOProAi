@@ -2453,6 +2453,7 @@ function bindView(path, root) {
         openRegisterOtpFlow(name, email, pass)
         return
       }
+      if (isAdmin(String(email).trim())) { toast('Admin account - opening the Admin login'); location.hash = '#/admin'; return }
       const r = await loginUser(email, pass)
       if (alertEl) alertEl.innerHTML = r.error ? '<div class="alert alert-error">' + esc(r.error) + '</div>' : ''
       if (r.ok) { toast('Welcome, ' + r.user.name.split(' ')[0]); location.hash = '#/dashboard' }
