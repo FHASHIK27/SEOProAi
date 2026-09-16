@@ -82,8 +82,18 @@ create policy "own profile update" on public.profiles
   for update using (auth.uid() = id) with check (auth.uid() = id);
 
 -- Admins can do everything (role stored in profiles).
+-- NOTE: policies on profiles must NOT query profiles directly or Postgres
+-- raises "infinite recursion detected in policy". Use a SECURITY DEFINER
+-- helper, which bypasses RLS for the lookup.
+create or replace function public.is_admin()
+returns boolean language sql security definer set search_path = public stable as $$
+  select exists (select 1 from public.profiles where id = auth.uid() and role = 'admin');
+$$;
+grant execute on function public.is_admin() to authenticated, anon;
+
+drop policy if exists "admin all profiles" on public.profiles;
 create policy "admin all profiles" on public.profiles
-  for all using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
+  for all using (public.is_admin()) with check (public.is_admin());
 
 create policy "own payments read" on public.payments
   for select using (auth.uid() in (select id from public.profiles where email = payments.email));
@@ -91,18 +101,21 @@ create policy "own payments write" on public.payments
   for insert with check (auth.uid() in (select id from public.profiles where email = payments.email));
 create policy "own payments update" on public.payments
   for update using (auth.uid() in (select id from public.profiles where email = payments.email));
+drop policy if exists "admin all payments" on public.payments;
 create policy "admin all payments" on public.payments
-  for all using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
+  for all using (public.is_admin()) with check (public.is_admin());
 
 create policy "own reports" on public.reports
   for all using (auth.uid() in (select id from public.profiles where email = reports.email));
+drop policy if exists "admin all reports" on public.reports;
 create policy "admin all reports" on public.reports
-  for all using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
+  for all using (public.is_admin()) with check (public.is_admin());
 
 create policy "own chats" on public.chats
   for all using (auth.uid() in (select id from public.profiles where email = chats.email));
+drop policy if exists "admin all chats" on public.chats;
 create policy "admin all chats" on public.chats
-  for all using (exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'admin'));
+  for all using (public.is_admin()) with check (public.is_admin());
 
 -- Promote the first admin after signing up with Supabase Auth:
 -- update public.profiles set role = 'admin' where email = 'admin@seo-service-provider.com';
