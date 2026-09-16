@@ -2,6 +2,7 @@
 .claude
 .gemini
 .opencode
+.vercel
 
 # IDE and Editors
 **/.idea/
