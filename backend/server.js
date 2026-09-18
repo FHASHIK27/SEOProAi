@@ -163,6 +163,86 @@ function requireAdmin(req, res, next) {
   next()
 }
 
+// ---------------------------------------------------------------- admin account store
+// Optional server-side persistence for admin credentials/recovery, via the
+// Supabase REST API with the service-role key (kept server-side only).
+const SUPABASE_URL = String(process.env.SUPABASE_URL || '').replace(/\/$/, '')
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || ''
+const ADMIN_SETTINGS_KEY = 'admin_account'
+
+function supabaseReady() { return !!(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) }
+
+function supaHeaders(extra) {
+  return Object.assign({
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE_KEY,
+    'Content-Type': 'application/json'
+  }, extra || {})
+}
+
+async function supaReadSetting(key) {
+  if (!supabaseReady()) return null
+  const r = await fetch(SUPABASE_URL + '/rest/v1/app_settings?key=eq.' + encodeURIComponent(key) + '&select=value', { headers: supaHeaders() })
+  if (!r.ok) throw new Error('read ' + r.status)
+  const rows = await r.json()
+  return rows && rows[0] ? rows[0].value : null
+}
+
+async function supaWriteSetting(key, value) {
+  if (!supabaseReady()) throw new Error('Server storage is not configured')
+  const r = await fetch(SUPABASE_URL + '/rest/v1/app_settings?on_conflict=key', {
+    method: 'POST',
+    headers: supaHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+    body: JSON.stringify([{ key, value, updated_at: new Date().toISOString() }])
+  })
+  if (!r.ok) throw new Error('write ' + r.status + ' ' + String(await r.text().catch(() => '')).slice(0, 160))
+  return true
+}
+
+function hashAdminPassword(pw) {
+  const salt = crypto.randomBytes(16).toString('hex')
+  const h = crypto.scryptSync(String(pw), salt, 64).toString('hex')
+  return 'scrypt$' + salt + '$' + h
+}
+
+function verifyAdminPasswordHash(pw, stored) {
+  try {
+    if (!stored || String(stored).indexOf('scrypt$') !== 0) return false
+    const parts = String(stored).split('$')
+    if (parts.length !== 3) return false
+    const calc = crypto.scryptSync(String(pw), parts[1], 64).toString('hex')
+    return safeEqual(calc, parts[2])
+  } catch (e) { return false }
+}
+
+async function loadAdminAccount(email) {
+  try {
+    const all = await supaReadSetting(ADMIN_SETTINGS_KEY)
+    if (all && typeof all === 'object' && all[email]) return all[email]
+  } catch (e) { /* storage optional */ }
+  return null
+}
+
+async function saveAdminAccount(email, patch) {
+  let all = {}
+  try { all = (await supaReadSetting(ADMIN_SETTINGS_KEY)) || {} } catch (e) { all = {} }
+  if (typeof all !== 'object' || Array.isArray(all)) all = {}
+  all[email] = Object.assign({}, all[email] || {}, patch, { updatedAt: new Date().toISOString() })
+  await supaWriteSetting(ADMIN_SETTINGS_KEY, all)
+  return all[email]
+}
+
+function maskContact(channel, contact) {
+  const c = String(contact || '')
+  if (channel === 'email') {
+    const at = c.indexOf('@')
+    if (at < 1) return c
+    const name = c.slice(0, at)
+    return name.slice(0, 2) + '*'.repeat(Math.max(1, name.length - 2)) + c.slice(at)
+  }
+  return c.length > 4 ? '*'.repeat(c.length - 4) + c.slice(-4) : c
+}
+
 const TIMEOUT_MS = 15000
 const PAGESPEED_TIMEOUT_MS = 60000
 const GEMINI_KEY_VALID = /^(AIza|AQ\.)/.test(GEMINI_API_KEY)
@@ -897,23 +977,32 @@ async function sendRealOtp(channel, contact, code, purpose) {
             text
           })
         })
-        return res.ok
+        if (!res.ok) {
+          const body = await res.text().catch(() => '')
+          return { ok: false, error: 'Email provider returned ' + res.status + (body ? ': ' + body.slice(0, 180) : '') }
+        }
+        return { ok: true }
       }
       const nodemailer = await import('nodemailer').catch(() => null)
-      if (!nodemailer) return false
+      if (!nodemailer) return { ok: false, error: 'Mail library unavailable on the server.' }
       const t = nodemailer.createTransport({
         host: process.env.SMTP_HOST,
         port: Number(process.env.SMTP_PORT || 587),
         secure: process.env.SMTP_SECURE === '1',
         auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
       })
-      await t.sendMail({
-        from: process.env.EMAIL_FROM || process.env.SMTP_USER,
-        to: contact,
-        subject,
-        text
-      })
-      return true
+      try {
+        await t.sendMail({
+          from: process.env.EMAIL_FROM || process.env.SMTP_USER,
+          to: contact,
+          subject,
+          text
+        })
+        return { ok: true }
+      } catch (e) {
+        const raw = (e && (e.response || e.message)) ? String(e.response || e.message) : 'SMTP rejected the message.'
+        return { ok: false, error: raw.slice(0, 200) }
+      }
     }
     if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
       const sid = process.env.TWILIO_ACCOUNT_SID
@@ -921,25 +1010,74 @@ async function sendRealOtp(channel, contact, code, purpose) {
       const from = channel === 'whatsapp' ? (process.env.TWILIO_WHATSAPP_FROM || process.env.TWILIO_PHONE_FROM) : process.env.TWILIO_PHONE_FROM
       const to = channel === 'whatsapp' ? 'whatsapp:' + contact : contact
       const dest = channel === 'whatsapp' ? from && from.startsWith('whatsapp:') ? from : 'whatsapp:' + (from || '') : from
-      if (!to || !dest || dest === 'whatsapp:') return false
+      if (!to || !dest || dest === 'whatsapp:') return { ok: false, error: 'Phone sender is not configured.' }
       const res = await fetch('https://api.twilio.com/2010-04-01/Accounts/' + sid + '/Messages.json', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: 'Basic ' + Buffer.from(sid + ':' + token).toString('base64') },
         body: new URLSearchParams({ To: to, From: dest, Body: otpMessage(purpose, code) }).toString()
       })
-      return res.ok
+      if (!res.ok) {
+        const body = await res.text().catch(() => '')
+        return { ok: false, error: 'SMS provider returned ' + res.status + (body ? ': ' + body.slice(0, 180) : '') }
+      }
+      return { ok: true }
     }
-    return false
+    return { ok: false, error: 'No phone provider is configured.' }
   } catch (e) {
-    return false
+    return { ok: false, error: (e && e.message) ? String(e.message).slice(0, 200) : 'Delivery failed.' }
   }
 }
 
-async function deliverOtp(channel, contact, code, purpose, forceDev) {
-  const hasProvider = !forceDev && (channel === 'email' ? emailProviderConfigured() : phoneProviderConfigured())
-  if (!hasProvider) return { dev: true }
-  const ok = await sendRealOtp(channel, contact, code, purpose)
-  return ok ? { real: true } : { dev: true, fallback: true }
+async function deliverOtp(channel, contact, code, purpose, allowDev) {
+  if (allowDev) return { ok: true, dev: true }
+  const hasProvider = channel === 'email' ? emailProviderConfigured() : phoneProviderConfigured()
+  if (!hasProvider) {
+    return {
+      ok: false,
+      reason: channel === 'email'
+        ? 'Email delivery is not configured on the server (set SMTP_HOST/SMTP_USER/SMTP_PASS or RESEND_API_KEY).'
+        : 'WhatsApp/SMS delivery is not configured on the server (set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and a sender).'
+    }
+  }
+  return await sendRealOtp(channel, contact, code, purpose)
+}
+
+// Shared OTP issue/verify used by user flows and the admin account flows.
+async function issueOtp(channel, contact, purpose, allowDev) {
+  pruneOtp()
+  const now = Date.now()
+  const key = purpose + ':' + contact
+  const prev = otpCodes.get(key)
+  if (prev && now < prev.cooldown) {
+    return { ok: false, error: 'Please wait ' + Math.ceil((prev.cooldown - now) / 1000) + 's before requesting a new code.' }
+  }
+  const log = otpSendLog.get(key) || []
+  const hourLog = log.filter(t => now - t < 3600000)
+  if (hourLog.length >= OTP_HOUR_CAP) return { ok: false, error: 'Too many code requests for this contact. Try again later.' }
+  const code = genOtpCode()
+  otpCodes.set(key, { hash: sha256hex(code), exp: now + OTP_TTL_MS, tries: 0, cooldown: now + OTP_COOLDOWN_MS, purpose, channel, contact })
+  otpSendLog.set(key, hourLog.concat([now]))
+  const delivery = await deliverOtp(channel, contact, code, purpose, allowDev)
+  if (!delivery.ok) {
+    otpCodes.delete(key)
+    return { ok: false, error: 'Could not send the code to ' + maskContact(channel, contact) + '. ' + (delivery.reason || delivery.error || 'Please try again later.') }
+  }
+  return { ok: true, code, dev: !!delivery.dev, channel, contact }
+}
+
+function consumeOtp(channel, contact, purpose, code) {
+  pruneOtp()
+  const key = purpose + ':' + contact
+  const entry = otpCodes.get(key)
+  if (!entry) return { ok: false, error: 'No active code for this contact. Request a new one first.' }
+  if (Date.now() > entry.exp) { otpCodes.delete(key); return { ok: false, error: 'Code expired. Request a new one.' } }
+  if (entry.tries >= OTP_MAX_ATTEMPTS) { otpCodes.delete(key); return { ok: false, error: 'Too many wrong attempts. Request a new code.' } }
+  if (sha256hex(String(code).trim()) !== entry.hash) {
+    entry.tries += 1
+    return { ok: false, error: 'Incorrect code. ' + (OTP_MAX_ATTEMPTS - entry.tries) + ' attempts left.' }
+  }
+  otpCodes.delete(key)
+  return { ok: true }
 }
 
 app.post('/api/otp/send', otpLimit, async (req, res) => {
@@ -957,38 +1095,25 @@ app.post('/api/otp/send', otpLimit, async (req, res) => {
   } else if (!contactNorm) {
     return res.status(400).json({ status: 'Error', error: 'Enter a valid mobile number (7-15 digits)', compliance })
   }
-  pruneOtp()
-  const key = purpose + ':' + contactNorm
-  const now = Date.now()
-  const prev = otpCodes.get(key)
-  if (prev && now < prev.cooldown) {
-    const wait = Math.ceil((prev.cooldown - now) / 1000)
-    return res.status(429).json({ status: 'Error', error: 'Please wait ' + wait + 's before requesting a new code.', retryAfter: wait, compliance })
+  const allowDev = DEV_ROUTES_ENABLED && req.query.dev === '1'
+  const issued = await issueOtp(channel, contactNorm, purpose, allowDev)
+  if (!issued.ok) {
+    const rate = /wait|too many/i.test(issued.error || '')
+    return res.status(rate ? 429 : 502).json({ status: 'Error', error: issued.error, compliance })
   }
-  const log = otpSendLog.get(key) || []
-  const hourLog = log.filter(t => now - t < 3600000)
-  if (hourLog.length >= OTP_HOUR_CAP) {
-    return res.status(429).json({ status: 'Error', error: 'Too many code requests for this contact. Try again later.', compliance })
-  }
-  const code = genOtpCode()
-  otpCodes.set(key, { hash: sha256hex(code), exp: now + OTP_TTL_MS, tries: 0, cooldown: now + OTP_COOLDOWN_MS, purpose, channel, contact: contactNorm })
-  otpSendLog.set(key, hourLog.concat([now]))
-  const delivery = await deliverOtp(channel, contactNorm, code, purpose, req.query.dev === '1')
   const payload = {
     status: 'Real',
     purpose,
     channel,
     contact: contactNorm,
     ttlSeconds: OTP_TTL_MS / 1000,
-    delivery: delivery.dev ? 'dev-inbox' : 'real',
+    delivery: issued.dev ? 'dev-inbox' : 'sent',
     compliance
   }
-  if (delivery.dev) {
+  if (issued.dev) {
     payload.dev = true
-    payload.code = code
-    payload.notice = delivery.fallback
-      ? 'Delivery provider rejected the request, so the code is shown here (dev inbox). Check the provider credentials in backend/.env.'
-      : 'Demo mode: no ' + (channel === 'email' ? 'SMTP/Resend' : 'Twilio') + ' credentials are configured in backend/.env, so the code is shown here (dev inbox) instead of being sent. Add provider keys to deliver it for real.'
+    payload.code = issued.code
+    payload.notice = 'Development mode: the code is shown on screen because this is not a production environment.'
   }
   res.json(payload)
 })
@@ -997,17 +1122,8 @@ app.post('/api/otp/verify', authLimit, async (req, res) => {
   const { contact, channel = 'email', purpose = 'reset', code } = req.body
   const contactNorm = normalizeOtpContact(channel, contact)
   if (!contactNorm || !code) return res.status(400).json({ status: 'Error', error: 'contact and code are required', compliance })
-  pruneOtp()
-  const key = purpose + ':' + contactNorm
-  const entry = otpCodes.get(key)
-  if (!entry) return res.status(400).json({ status: 'Error', error: 'No active code for this contact. Request a new one first.', compliance })
-  if (Date.now() > entry.exp) { otpCodes.delete(key); return res.status(400).json({ status: 'Error', error: 'Code expired. Request a new one.', compliance }) }
-  if (entry.tries >= OTP_MAX_ATTEMPTS) { otpCodes.delete(key); return res.status(400).json({ status: 'Error', error: 'Too many wrong attempts. Request a new code.', compliance }) }
-  if (sha256hex(String(code).trim()) !== entry.hash) {
-    entry.tries += 1
-    return res.status(400).json({ status: 'Error', error: 'Incorrect code. ' + (OTP_MAX_ATTEMPTS - entry.tries) + ' attempts left.', compliance })
-  }
-  otpCodes.delete(key)
+  const verified = consumeOtp(channel, contactNorm, purpose, code)
+  if (!verified.ok) return res.status(400).json({ status: 'Error', error: verified.error, compliance })
   const payload = { status: 'Real', verified: true, purpose, contact: contactNorm, compliance }
   if (purpose === 'reset') {
     const token = crypto.randomBytes(32).toString('hex')
@@ -1294,11 +1410,15 @@ app.get('/api/health', (req, res) => {
 
 // ---------------------------------------------------------------- admin auth
 
-app.post('/api/admin/login', authLimit, (req, res) => {
+app.post('/api/admin/login', authLimit, async (req, res) => {
   const email = String((req.body && req.body.email) || '').toLowerCase().trim()
   const password = String((req.body && req.body.password) || '')
   if (!ADMIN_EMAILS.includes(email)) return res.status(401).json({ status: 'Error', error: 'Not an admin account' })
-  if (!safeEqual(password, ADMIN_PASSWORD)) return res.status(401).json({ status: 'Error', error: 'Wrong admin password' })
+  const acct = await loadAdminAccount(email)
+  let ok = false
+  if (acct && acct.hash) ok = verifyAdminPasswordHash(password, acct.hash)
+  if (!ok) ok = safeEqual(password, ADMIN_PASSWORD)
+  if (!ok) return res.status(401).json({ status: 'Error', error: 'Wrong admin password' })
   res.json({ status: 'Real', email, token: makeAdminToken(email), expiresIn: ADMIN_TOKEN_TTL_MS })
 })
 
@@ -1306,6 +1426,153 @@ app.get('/api/admin/verify', (req, res) => {
   const data = verifyAdminToken(req.headers['x-admin-token'])
   if (!data) return res.status(401).json({ status: 'Error', error: 'Invalid or expired admin session' })
   res.json({ status: 'Real', email: data.email, expiresAt: data.exp })
+})
+
+// ---------------------------------------------------------------- admin account (password / recovery / phone)
+const PHONE_PURPOSES = ['admin_phone']
+const ADMIN_RESET_PURPOSE = 'admin_reset'
+
+app.get('/api/admin/account', requireAdmin, async (req, res) => {
+  try {
+    const acct = (await loadAdminAccount(req.adminEmail)) || {}
+    res.json({
+      status: 'Real',
+      email: req.adminEmail,
+      recoveryEmail: acct.recoveryEmail || '',
+      phone: acct.phone ? maskContact('sms', acct.phone) : '',
+      phoneVerified: !!acct.phoneVerified,
+      passwordSet: !!acct.hash,
+      storageReady: supabaseReady(),
+      emailProvider: emailProviderConfigured(),
+      phoneProvider: phoneProviderConfigured(),
+      compliance
+    })
+  } catch (e) {
+    res.status(500).json({ status: 'Error', error: 'Could not load account settings.', compliance })
+  }
+})
+
+app.post('/api/admin/account/password', authLimit, requireAdmin, async (req, res) => {
+  const currentPassword = String((req.body && req.body.currentPassword) || '')
+  const newPassword = String((req.body && req.body.newPassword) || '')
+  if (newPassword.length < 8) return res.status(400).json({ status: 'Error', error: 'New password must be at least 8 characters.', compliance })
+  const acct = await loadAdminAccount(req.adminEmail)
+  let ok = false
+  if (acct && acct.hash) ok = verifyAdminPasswordHash(currentPassword, acct.hash)
+  if (!ok) ok = safeEqual(currentPassword, ADMIN_PASSWORD)
+  if (!ok) return res.status(401).json({ status: 'Error', error: 'Current password is incorrect.', compliance })
+  if (!supabaseReady()) return res.status(503).json({ status: 'Error', error: 'Server storage is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.', compliance })
+  try {
+    await saveAdminAccount(req.adminEmail, { hash: hashAdminPassword(newPassword), passwordChangedAt: new Date().toISOString() })
+    res.json({ status: 'Real', changed: true, notice: 'Admin password updated. Use it from the next login.', compliance })
+  } catch (e) {
+    res.status(500).json({ status: 'Error', error: 'Could not save the new password. ' + String((e && e.message) || ''), compliance })
+  }
+})
+
+app.post('/api/admin/account/recovery', requireAdmin, async (req, res) => {
+  const recoveryEmail = String((req.body && req.body.recoveryEmail) || '').trim().toLowerCase()
+  if (!EMAIL_RE.test(recoveryEmail)) return res.status(400).json({ status: 'Error', error: 'Enter a valid recovery email address.', compliance })
+  if (!supabaseReady()) return res.status(503).json({ status: 'Error', error: 'Server storage is not configured.', compliance })
+  try {
+    await saveAdminAccount(req.adminEmail, { recoveryEmail })
+    res.json({ status: 'Real', saved: true, recoveryEmail, notice: 'Recovery email saved.', compliance })
+  } catch (e) {
+    res.status(500).json({ status: 'Error', error: 'Could not save the recovery email.', compliance })
+  }
+})
+
+app.post('/api/admin/account/phone', otpLimit, requireAdmin, async (req, res) => {
+  const channel = String((req.body && req.body.channel) || 'whatsapp').toLowerCase()
+  if (['whatsapp', 'sms'].indexOf(channel) < 0) return res.status(400).json({ status: 'Error', error: 'channel must be whatsapp or sms', compliance })
+  const phone = normalizeOtpContact('sms', (req.body && req.body.phone) || '')
+  if (!phone) return res.status(400).json({ status: 'Error', error: 'Enter a valid mobile number (7-15 digits).', compliance })
+  if (!supabaseReady()) return res.status(503).json({ status: 'Error', error: 'Server storage is not configured.', compliance })
+  const allowDev = DEV_ROUTES_ENABLED && req.query.dev === '1'
+  const issued = await issueOtp(channel, phone, PHONE_PURPOSES[0], allowDev)
+  if (!issued.ok) {
+    const rate = /wait|too many/i.test(issued.error || '')
+    return res.status(rate ? 429 : 502).json({ status: 'Error', error: issued.error, compliance })
+  }
+  try { await saveAdminAccount(req.adminEmail, { pendingPhone: phone }) } catch (e) {}
+  const out = { status: 'Real', channel, contact: maskContact('sms', phone), delivery: issued.dev ? 'dev-inbox' : 'sent', compliance }
+  if (issued.dev) { out.dev = true; out.code = issued.code }
+  res.json(out)
+})
+
+app.post('/api/admin/account/phone/verify', authLimit, requireAdmin, async (req, res) => {
+  const code = String((req.body && req.body.code) || '').trim()
+  const acct = await loadAdminAccount(req.adminEmail)
+  const phone = acct && acct.pendingPhone
+  if (!phone) return res.status(400).json({ status: 'Error', error: 'Request a code to your number first.', compliance })
+  const v = consumeOtp('whatsapp', phone, PHONE_PURPOSES[0], code)
+  if (!v.ok) return res.status(400).json({ status: 'Error', error: v.error, compliance })
+  try {
+    await saveAdminAccount(req.adminEmail, { phone, phoneVerified: true, pendingPhone: null })
+    res.json({ status: 'Real', phoneVerified: true, phone: maskContact('sms', phone), compliance })
+  } catch (e) {
+    res.status(500).json({ status: 'Error', error: 'Verified but could not save the number.', compliance })
+  }
+})
+
+// Admin password recovery (works from the admin login screen, before a session exists).
+app.post('/api/admin/account/forgot', otpLimit, async (req, res) => {
+  const email = String((req.body && req.body.email) || '').toLowerCase().trim()
+  const channel = String((req.body && req.body.channel) || 'email').toLowerCase()
+  if (!ADMIN_EMAILS.includes(email)) {
+    return res.json({ status: 'Real', sent: false, notice: 'If that admin account exists, a code has been sent.', compliance })
+  }
+  if (!supabaseReady()) return res.status(503).json({ status: 'Error', error: 'Server storage is not configured.', compliance })
+  const acct = await loadAdminAccount(email)
+  const contact = channel === 'email' ? ((acct && acct.recoveryEmail) || email) : (acct && acct.phone)
+  if (!contact) return res.status(400).json({ status: 'Error', error: 'No ' + (channel === 'email' ? 'recovery email' : 'verified phone') + ' is saved for this admin account.', compliance })
+  if (channel !== 'email' && !(acct && acct.phoneVerified)) return res.status(400).json({ status: 'Error', error: 'The saved phone number is not verified yet.', compliance })
+  const allowDev = DEV_ROUTES_ENABLED && req.query.dev === '1'
+  const issued = await issueOtp(channel === 'email' ? 'email' : channel, contact, ADMIN_RESET_PURPOSE, allowDev)
+  if (!issued.ok) {
+    const rate = /wait|too many/i.test(issued.error || '')
+    return res.status(rate ? 429 : 502).json({ status: 'Error', error: issued.error, compliance })
+  }
+  const out = { status: 'Real', channel, contact: maskContact(channel, contact), delivery: issued.dev ? 'dev-inbox' : 'sent', compliance }
+  if (issued.dev) { out.dev = true; out.code = issued.code }
+  res.json(out)
+})
+
+app.post('/api/admin/account/forgot/verify', authLimit, async (req, res) => {
+  const email = String((req.body && req.body.email) || '').toLowerCase().trim()
+  const channel = String((req.body && req.body.channel) || 'email').toLowerCase()
+  const code = String((req.body && req.body.code) || '').trim()
+  if (!ADMIN_EMAILS.includes(email)) return res.status(401).json({ status: 'Error', error: 'Invalid or expired code.', compliance })
+  const acct = await loadAdminAccount(email)
+  const contact = channel === 'email' ? ((acct && acct.recoveryEmail) || email) : (acct && acct.phone)
+  if (!contact) return res.status(400).json({ status: 'Error', error: 'No recovery contact saved.', compliance })
+  const v = consumeOtp(channel, contact, ADMIN_RESET_PURPOSE, code)
+  if (!v.ok) return res.status(400).json({ status: 'Error', error: v.error, compliance })
+  const token = crypto.randomBytes(32).toString('hex')
+  resetTokens.set(token, { purpose: ADMIN_RESET_PURPOSE, contact, exp: Date.now() + RESET_TOKEN_TTL_MS, used: false })
+  res.json({ status: 'Real', verified: true, resetToken: token, compliance })
+})
+
+app.post('/api/admin/account/reset', authLimit, async (req, res) => {
+  const email = String((req.body && req.body.email) || '').toLowerCase().trim()
+  const resetToken = String((req.body && req.body.resetToken) || '')
+  const newPassword = String((req.body && req.body.newPassword) || '')
+  if (!ADMIN_EMAILS.includes(email)) return res.status(401).json({ status: 'Error', error: 'Not an admin account', compliance })
+  if (newPassword.length < 8) return res.status(400).json({ status: 'Error', error: 'New password must be at least 8 characters.', compliance })
+  const entry = resetTokens.get(resetToken)
+  if (!entry || entry.used || entry.purpose !== ADMIN_RESET_PURPOSE || Date.now() > entry.exp) {
+    resetTokens.delete(resetToken)
+    return res.status(400).json({ status: 'Error', error: 'Invalid or expired reset token. Request a new code.', compliance })
+  }
+  if (!supabaseReady()) return res.status(503).json({ status: 'Error', error: 'Server storage is not configured.', compliance })
+  entry.used = true
+  resetTokens.delete(resetToken)
+  try {
+    await saveAdminAccount(email, { hash: hashAdminPassword(newPassword), passwordChangedAt: new Date().toISOString() })
+    res.json({ status: 'Real', reset: true, notice: 'Admin password updated. Sign in with the new password.', compliance })
+  } catch (e) {
+    res.status(500).json({ status: 'Error', error: 'Could not save the new password.', compliance })
+  }
 })
 
 // ---------------------------------------------------------------- crypto verify

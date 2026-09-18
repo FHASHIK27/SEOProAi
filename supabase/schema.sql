@@ -119,3 +119,14 @@ create policy "admin all chats" on public.chats
 
 -- Promote the first admin after signing up with Supabase Auth:
 -- update public.profiles set role = 'admin' where email = 'admin@seo-service-provider.com';
+
+-- ---------------------------------------------------------------- app settings
+-- Server-only key/value store (e.g. admin password hash, recovery email, phone).
+-- RLS is enabled with no policies, so only the service-role key (used by the
+-- backend) can read or write it. The anon/browser key cannot touch it.
+create table if not exists public.app_settings (
+  key text primary key,
+  value jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+alter table public.app_settings enable row level security;

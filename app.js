@@ -355,6 +355,18 @@ async function apiPost(path, body, timeoutMs) {
   }
 }
 
+async function apiAdmin(path, body, method) {
+  try {
+    const headers = { 'Content-Type': 'application/json', 'x-admin-token': adminToken() || '' }
+    const opts = { method: method || (body ? 'POST' : 'GET'), headers }
+    if (body) opts.body = JSON.stringify(body)
+    const r = await fetchTimeout(API + path, opts, 25000)
+    return await r.json()
+  } catch (e) {
+    return { status: 'Error', error: 'Backend unreachable. Please try again.' }
+  }
+}
+
 /* ============================================================== ui helpers */
 
 function toast(msg, type = 'success') {
@@ -1374,6 +1386,7 @@ function adminView() {
       '<div class="field"><label>Email</label><input type="email" id="adminEmail" value="admin@seo-service-provider.com"></div>' +
       '<div class="field"><label>Password</label><input type="password" id="adminPass" placeholder="Enter admin password"></div>' +
       '<button class="btn btn-primary" id="adminLoginBtn" style="width:100%" type="button">Login as Admin</button>' +
+      '<div class="center small muted mt-12"><a href="#" data-admin-forgot style="color:var(--primary-2)">Forgot admin password?</a></div>' +
       '<div class="center small muted mt-16">Protected by server verification + rate limiting. Bots cannot log in.</div>' +
       '</div></div>'
   }
@@ -1386,6 +1399,7 @@ function adminView() {
     ['trash', 'Trash' + (trashCount ? ' (' + trashCount + ')' : '')],
     ['payments', 'Payments'],
     ['chats', 'Live Chat' + (unreadTotal ? ' (' + unreadTotal + ')' : '')],
+    ['account', 'Account & Security'],
     ['dev', 'Development']
   ]
   const tabHtml = tabs.map(([id, label]) => '<button class="tab' + (state.adminTab === id ? ' active' : '') + '" data-atab="' + id + '" type="button">' + label + '</button>').join('')
@@ -1465,6 +1479,34 @@ function adminTabContent() {
       (p.status === 'pending' || p.status === 'auto_verifying' ? '<div class="flex"><button class="btn btn-success btn-sm" data-approve-pay="' + p.id + '" type="button">Approve</button><button class="btn btn-danger btn-sm" data-reject-pay="' + p.id + '" type="button">Reject</button></div>' : '<span class="muted small">-</span>') + '</td></tr>').join('')
     return '<h3>Payments (' + store.payments().length + ')</h3><div class="table-wrap mt-16"><table class="table"><thead><tr><th>ID</th><th>Customer</th><th>Plan</th><th>Method</th><th>Date</th><th>Status</th><th>Action</th></tr></thead><tbody>' + (rows || '<tr><td colspan="7" class="muted">No payments yet</td></tr>') + '</tbody></table></div>'
   }
+  if (state.adminTab === 'account') {
+    return '<h3>Account &amp; Security</h3>' +
+      '<p class="small muted mt-8">Change the admin password, add a recovery email, and verify a mobile number for WhatsApp/SMS password recovery.</p>' +
+      '<div id="adminAcctStatus" class="alert alert-info mt-16">Loading account status...</div>' +
+      '<div class="grid grid-2 mt-16" style="gap:16px">' +
+        '<div class="form-card"><h4>Change password</h4>' +
+          '<div class="field mt-8"><label>Current password</label><input type="password" id="acctCurPass" autocomplete="current-password"></div>' +
+          '<div class="field"><label>New password (min 8 characters)</label><input type="password" id="acctNewPass" autocomplete="new-password"></div>' +
+          '<div class="field"><label>Confirm new password</label><input type="password" id="acctNewPass2" autocomplete="new-password"></div>' +
+          '<button class="btn btn-primary" id="acctPassBtn" type="button">Update password</button>' +
+          '<div id="acctPassMsg" class="mt-8"></div>' +
+        '</div>' +
+        '<div class="form-card"><h4>Recovery email</h4>' +
+          '<p class="small muted">Used to send password reset codes if you lose your password.</p>' +
+          '<div class="field"><label>Recovery email</label><input type="email" id="acctRecovery" placeholder="you@example.com"></div>' +
+          '<button class="btn btn-primary" id="acctRecoveryBtn" type="button">Save recovery email</button>' +
+          '<div id="acctRecoveryMsg" class="mt-8"></div>' +
+          '<h4 class="mt-24">Mobile number (WhatsApp / SMS)</h4>' +
+          '<p class="small muted">Verify a number to reset your password by WhatsApp or SMS.</p>' +
+          '<div class="field"><label>Mobile number (with country code)</label><input type="tel" id="acctPhone" placeholder="+8801XXXXXXXXX"></div>' +
+          '<div class="input-row"><button class="btn btn-ghost" id="acctPhoneSendWa" type="button">Send code via WhatsApp</button>' +
+          '<button class="btn btn-ghost" id="acctPhoneSendSms" type="button">Send code via SMS</button></div>' +
+          '<div class="field mt-8"><label>One-time code</label><input type="text" id="acctPhoneCode" inputmode="numeric" maxlength="6" placeholder="6-digit code"></div>' +
+          '<button class="btn btn-primary" id="acctPhoneVerifyBtn" type="button">Verify number</button>' +
+          '<div id="acctPhoneMsg" class="mt-8"></div>' +
+        '</div>' +
+      '</div>'
+  }
   if (state.adminTab === 'dev') {
     return devAdminContent()
   }
@@ -1487,6 +1529,147 @@ function adminTabContent() {
       '<div class="input-row mt-16"><input type="text" id="adminReplyInput" placeholder="Reply as admin..."><button class="btn btn-primary" data-send-reply="' + open.id + '" type="button">Send</button></div></div>'
   }
   return '<h3>Live Chat</h3><div class="chat-list mt-16">' + list + '</div>'
+}
+
+/* ---------- admin account & security ---------- */
+
+function acctMsg(id, msg, ok) {
+  const el = document.getElementById(id)
+  if (el) el.innerHTML = '<div class="alert ' + (ok ? 'alert-info' : 'alert-error') + '">' + esc(msg) + '</div>'
+}
+
+async function adminAccountLoad() {
+  const statusEl = document.getElementById('adminAcctStatus')
+  const recoveryEl = document.getElementById('acctRecovery')
+  const res = await apiAdmin('/api/admin/account', null, 'GET')
+  if (!res || res.status !== 'Real') {
+    if (statusEl) statusEl.innerHTML = '<b>Could not load account settings.</b> ' + esc((res && res.error) || 'Please try again.')
+    return
+  }
+  if (statusEl) {
+    statusEl.innerHTML =
+      'Signed in as <b>' + esc(res.email) + '</b> - storage: ' +
+      (res.storageReady ? '<span class="label-pill label-good">ready</span>' : '<span class="label-pill label-veryhigh">not configured</span>') +
+      ' - email delivery: ' + (res.emailProvider ? '<span class="label-pill label-good">configured</span>' : '<span class="label-pill label-veryhigh">missing</span>') +
+      ' - WhatsApp/SMS: ' + (res.phoneProvider ? '<span class="label-pill label-good">configured</span>' : '<span class="label-pill label-veryhigh">missing</span>') +
+      (res.phoneVerified ? ' - phone <b>' + esc(res.phone) + '</b> <span class="label-pill label-good">verified</span>' : '')
+  }
+  if (recoveryEl && res.recoveryEmail) recoveryEl.value = res.recoveryEmail
+}
+
+function bindAdminAccount() {
+  const passBtn = document.getElementById('acctPassBtn')
+  if (passBtn) passBtn.addEventListener('click', async () => {
+    const cur = (document.getElementById('acctCurPass') || {}).value || ''
+    const np = (document.getElementById('acctNewPass') || {}).value || ''
+    const np2 = (document.getElementById('acctNewPass2') || {}).value || ''
+    if (np.length < 8) { acctMsg('acctPassMsg', 'New password must be at least 8 characters.', false); return }
+    if (np !== np2) { acctMsg('acctPassMsg', 'The two new passwords do not match.', false); return }
+    passBtn.disabled = true
+    const res = await apiAdmin('/api/admin/account/password', { currentPassword: cur, newPassword: np })
+    passBtn.disabled = false
+    acctMsg('acctPassMsg', (res && (res.notice || res.error)) || 'Could not update the password.', !!(res && res.changed))
+    if (res && res.changed) ['acctCurPass', 'acctNewPass', 'acctNewPass2'].forEach(id => { const el = document.getElementById(id); if (el) el.value = '' })
+  })
+
+  const recBtn = document.getElementById('acctRecoveryBtn')
+  if (recBtn) recBtn.addEventListener('click', async () => {
+    const recoveryEmail = ((document.getElementById('acctRecovery') || {}).value || '').trim()
+    recBtn.disabled = true
+    const res = await apiAdmin('/api/admin/account/recovery', { recoveryEmail })
+    recBtn.disabled = false
+    acctMsg('acctRecoveryMsg', (res && (res.notice || res.error)) || 'Could not save the recovery email.', !!(res && res.saved))
+  })
+
+  const sendPhone = async (channel) => {
+    const phone = ((document.getElementById('acctPhone') || {}).value || '').trim()
+    const res = await apiAdmin('/api/admin/account/phone', { phone, channel })
+    if (res && res.dev && res.code) { const el = document.getElementById('acctPhoneCode'); if (el) el.value = res.code }
+    acctMsg('acctPhoneMsg', (res && (res.error || ('Code sent to ' + (res.contact || phone) + (res.dev ? ' (development preview).' : '.')))) || 'Could not send the code.', !!(res && res.status === 'Real'))
+  }
+  const wa = document.getElementById('acctPhoneSendWa'); if (wa) wa.addEventListener('click', () => sendPhone('whatsapp'))
+  const sms = document.getElementById('acctPhoneSendSms'); if (sms) sms.addEventListener('click', () => sendPhone('sms'))
+
+  const vBtn = document.getElementById('acctPhoneVerifyBtn')
+  if (vBtn) vBtn.addEventListener('click', async () => {
+    const code = ((document.getElementById('acctPhoneCode') || {}).value || '').trim()
+    vBtn.disabled = true
+    const res = await apiAdmin('/api/admin/account/phone/verify', { code })
+    vBtn.disabled = false
+    acctMsg('acctPhoneMsg', (res && (res.error || (res.phoneVerified ? 'Number verified: ' + res.phone : ''))) || 'Verification failed.', !!(res && res.phoneVerified))
+    if (res && res.phoneVerified) adminAccountLoad()
+  })
+
+  adminAccountLoad()
+}
+
+/* ---------- admin password recovery via OTP ---------- */
+
+function openAdminForgot() {
+  const email = ((document.getElementById('adminEmail') || {}).value || 'admin@seo-service-provider.com').trim().toLowerCase()
+  openModal('<h3>Reset admin password</h3><p class="m-sub">Choose where to receive the one-time code.</p>' +
+    '<div class="otp-channels">' +
+      '<button class="btn btn-ghost" data-admin-forgot-ch="email" type="button">Email me a code<br><span class="small muted">recovery email</span></button>' +
+      '<button class="btn btn-ghost" data-admin-forgot-ch="whatsapp" type="button">WhatsApp a code<br><span class="small muted">verified number</span></button>' +
+      '<button class="btn btn-ghost" data-admin-forgot-ch="sms" type="button">SMS a code<br><span class="small muted">verified number</span></button>' +
+    '</div><div id="adminForgotMsg" class="mt-8"></div>' +
+    '<div class="modal-actions"><button class="btn btn-ghost" data-close-modal type="button">Cancel</button></div>')
+  const msg = (m, ok) => { const el = document.getElementById('adminForgotMsg'); if (el) el.innerHTML = '<div class="alert ' + (ok ? 'alert-info' : 'alert-error') + '">' + esc(m) + '</div>' }
+  document.querySelectorAll('[data-admin-forgot-ch]').forEach(b => b.addEventListener('click', async () => {
+    const channel = b.getAttribute('data-admin-forgot-ch')
+    const old = b.innerHTML
+    b.disabled = true
+    b.innerHTML = '<span class="spinner"></span> Sending...'
+    const res = await apiPost('/api/admin/account/forgot', { email, channel })
+    if (!res || res.status !== 'Real') { b.disabled = false; b.innerHTML = old; return msg((res && res.error) || 'Could not send the code.', false) }
+    adminForgotStepCode(email, channel, res)
+  }))
+}
+
+function adminForgotStepCode(email, channel, sent) {
+  openModal('<h3>Enter the code</h3><p class="m-sub">Enter the 6-digit code sent to <b>' + esc(sent.contact || '') + '</b>.</p>' +
+    (sent.dev && sent.code ? '<div class="alert alert-info"><b>Development preview</b> - code: <b>' + esc(sent.code) + '</b></div>' : '') +
+    '<div class="field"><label>One-time code</label><input type="text" id="afCode" inputmode="numeric" maxlength="6" placeholder="6-digit code"></div>' +
+    '<button class="btn btn-primary" id="afVerifyBtn" style="width:100%" type="button">Verify code</button>' +
+    '<div id="afMsg" class="mt-8"></div>' +
+    '<div class="modal-actions"><button class="btn btn-ghost" data-close-modal type="button">Cancel</button></div>')
+  const btn = document.getElementById('afVerifyBtn')
+  btn.addEventListener('click', async () => {
+    const code = (document.getElementById('afCode').value || '').trim()
+    btn.disabled = true
+    const res = await apiPost('/api/admin/account/forgot/verify', { email, channel, code })
+    btn.disabled = false
+    if (!res || res.status !== 'Real') {
+      const el = document.getElementById('afMsg')
+      if (el) el.innerHTML = '<div class="alert alert-error">' + esc((res && res.error) || 'Verification failed') + '</div>'
+      return
+    }
+    adminForgotStepNewPassword(email, res.resetToken)
+  })
+}
+
+function adminForgotStepNewPassword(email, resetToken) {
+  openModal('<h3>Set a new admin password</h3>' +
+    '<div class="field mt-8"><label>New password (min 8 characters)</label><input type="password" id="afNewPass" autocomplete="new-password"></div>' +
+    '<div class="field"><label>Confirm new password</label><input type="password" id="afNewPass2" autocomplete="new-password"></div>' +
+    '<button class="btn btn-primary" id="afSaveBtn" style="width:100%" type="button">Save new password</button>' +
+    '<div id="afMsg2" class="mt-8"></div>' +
+    '<div class="modal-actions"><button class="btn btn-ghost" data-close-modal type="button">Cancel</button></div>')
+  const btn = document.getElementById('afSaveBtn')
+  btn.addEventListener('click', async () => {
+    const np = (document.getElementById('afNewPass').value || '')
+    const np2 = (document.getElementById('afNewPass2').value || '')
+    const el = document.getElementById('afMsg2')
+    if (np.length < 8) { el.innerHTML = '<div class="alert alert-error">Password must be at least 8 characters.</div>'; return }
+    if (np !== np2) { el.innerHTML = '<div class="alert alert-error">Passwords do not match.</div>'; return }
+    btn.disabled = true
+    const res = await apiPost('/api/admin/account/reset', { email, resetToken, newPassword: np })
+    btn.disabled = false
+    if (!res || res.status !== 'Real') { el.innerHTML = '<div class="alert alert-error">' + esc((res && res.error) || 'Could not reset the password') + '</div>'; return }
+    closeModal()
+    toast('Admin password updated. Please log in.')
+    const p = document.getElementById('adminPass'); if (p) p.value = ''
+  })
 }
 
 function devStep(n, title, desc) {
@@ -2062,8 +2245,8 @@ function authView() {
 
 let otpState = null
 
-function otpModal(title, subtitle) {
-  openModal('<h3>' + esc(title) + '</h3><p class="m-sub">' + esc(subtitle || '') + '</p><div id="otpBox" class="otp-box"></div>' +
+function otpModal(title, subtitle, subtitleHtml) {
+  openModal('<h3>' + esc(title) + '</h3><p class="m-sub">' + (subtitleHtml ? (subtitle || '') : esc(subtitle || '')) + '</p><div id="otpBox" class="otp-box"></div>' +
     '<div class="modal-actions"><button class="btn btn-ghost" data-close-modal type="button">Cancel</button></div>')
   return document.getElementById('otpBox')
 }
@@ -2073,9 +2256,7 @@ function otpInfoHtml(msg) { return '<div class="alert alert-info">' + esc(msg) +
 
 function devInboxHtml(res) {
   if (!res || !res.dev || !res.code) return ''
-  return '<div class="alert alert-info otp-dev-inbox"><b>Demo inbox</b> - no ' +
-    (res.channel === 'email' ? 'SMTP/Resend' : 'Twilio') +
-    ' provider keys are configured in backend/.env, so the code is delivered here instead of being sent.<div class="otp-code">' +
+  return '<div class="alert alert-info otp-dev-inbox"><b>Development preview</b> - this environment is not configured to deliver messages, so the code is shown here instead.<div class="otp-code">' +
     esc(res.code) + '</div></div>'
 }
 
@@ -2211,7 +2392,7 @@ function openRegisterOtpFlow(name, email, pass) {
     sending: false, sent: null, reg: { name: String(name || '').trim(), email: emailKey, pass }
   }
   const box = otpModal('Verify your email',
-    'A one-time code is being sent to <b>' + esc(emailKey) + '</b>. Enter it to activate your new account. Codes expire in 5 minutes.')
+    'A one-time code is being sent to <b>' + esc(emailKey) + '</b>. Enter it to activate your new account. Codes expire in 5 minutes.', true)
   otpState.box = box
   otpSendAndStep()
 }
@@ -2469,7 +2650,12 @@ function bindView(path, root) {
   const verifyPhoneBtn = root.querySelector('[data-verify-phone]')
   if (verifyPhoneBtn) verifyPhoneBtn.addEventListener('click', openPhoneVerify)
 
-  if (path === '/admin' && state.adminTab === 'dev') devBoot()
+  if (path === '/admin') {
+    const forgotLink = root.querySelector('[data-admin-forgot]')
+    if (forgotLink) forgotLink.addEventListener('click', e => { e.preventDefault(); openAdminForgot() })
+    if (state.adminTab === 'account') bindAdminAccount()
+    if (state.adminTab === 'dev') devBoot()
+  }
 }
 
 function showDashTab(tab) {
