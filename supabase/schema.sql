@@ -36,6 +36,8 @@ create table if not exists public.payments (
   method text,
   method_id text,
   trx text,
+  order_id text,
+  proof_image text,
   status text not null default 'pending' check (status in ('pending','auto_verifying','approved','rejected')),
   auto_approved boolean not null default false,
   verified_at timestamptz,
@@ -124,6 +126,15 @@ create policy "admin all chats" on public.chats
 -- Server-only key/value store (e.g. admin password hash, recovery email, phone).
 -- RLS is enabled with no policies, so only the service-role key (used by the
 -- backend) can read or write it. The anon/browser key cannot touch it.
+--
+-- Keys used by the Admin Panel (written only through backend service-role routes):
+--   admin_account   - admin password hash + recovery email/phone (per admin email)
+--   site_settings   - { maintenance, allowRegistration, concurrencyLimit }
+--   plans           - array of subscription plans (name, price, agents, daily, monthly, features)
+--   payment_methods - array of payment gateways (bKash, Nagad, Bank, Binance Pay, crypto...)
+--   moderators      - array of moderator accounts (scrypt hash, active, permissions)
+--   system_logs     - recent background job logs (SEO/AI jobs, success/failure)
+--   audit_logs      - security history (admin/moderator logins, settings, backups, CRUD)
 create table if not exists public.app_settings (
   key text primary key,
   value jsonb not null default '{}'::jsonb,

@@ -175,3 +175,4 @@
 *.lz
 *.lzma
 *.iso
+.env*

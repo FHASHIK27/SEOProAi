@@ -29,17 +29,38 @@ function adminToken() {
   } catch (e) { return null }
 }
 
-function setAdminToken(email, token, expiresIn) {
-  sessionStorage.setItem(ADMIN_TOKEN_KEY, JSON.stringify({ email: email.toLowerCase(), token, exp: Date.now() + (expiresIn || 8 * 3600 * 1000) }))
+function setAdminToken(email, token, expiresIn, role, permissions) {
+  sessionStorage.setItem(ADMIN_TOKEN_KEY, JSON.stringify({
+    email: String(email || '').toLowerCase(),
+    token,
+    role: role === 'moderator' ? 'moderator' : 'admin',
+    permissions: Array.isArray(permissions) ? permissions : null,
+    exp: Date.now() + (expiresIn || 8 * 3600 * 1000)
+  }))
 }
 
 function clearAdminToken() { try { sessionStorage.removeItem(ADMIN_TOKEN_KEY) } catch (e) {} }
 
-function adminAuthed() {
-  const u = currentUser()
-  if (!u || !isAdmin(u.email)) return false
+function adminRole() {
   const t = adminToken()
-  return !!(t && t.email === u.email.toLowerCase())
+  return t && t.role === 'moderator' ? 'moderator' : 'admin'
+}
+
+function adminPermissions() {
+  const t = adminToken()
+  if (!t || t.role !== 'moderator') return ['all']
+  return Array.isArray(t.permissions) && t.permissions.length ? t.permissions : ['logs', 'chats']
+}
+
+function adminCan(perm) {
+  if (adminRole() === 'admin') return true
+  return adminPermissions().indexOf(perm) >= 0
+}
+
+// Backend always re-validates the signed token; this is just a UI gate.
+function adminAuthed() {
+  const t = adminToken()
+  return !!(t && t.token)
 }
 
 const PLANS = [
@@ -357,7 +378,8 @@ async function apiPost(path, body, timeoutMs) {
 
 async function apiAdmin(path, body, method) {
   try {
-    const headers = { 'Content-Type': 'application/json', 'x-admin-token': adminToken() || '' }
+    const t = adminToken()
+    const headers = { 'Content-Type': 'application/json', 'x-admin-token': (t && t.token) ? t.token : '' }
     const opts = { method: method || (body ? 'POST' : 'GET'), headers }
     if (body) opts.body = JSON.stringify(body)
     const r = await fetchTimeout(API + path, opts, 25000)
@@ -552,7 +574,7 @@ async function loginUser(email, password) {
   return { ok: true, user }
 }
 
-function logout() { if (cloudOn()) cloud().signOut(); setSession(null); clearAdminToken(); toast('Logged out'); location.hash = '#/' }
+function logout() { if (cloudOn()) cloud().signOut(); setSession(null); clearAdminToken(); toast('Logged out'); go('/') }
 
 function activatePremium(userEmail, plan, paymentId) {
   const users = store.users()
@@ -580,9 +602,35 @@ function localUsageFor(email) {
 let selectedMethod = null
 let buyPlanId = null
 
+function compressImageFile(file, maxDim, quality) {
+  return new Promise((resolve) => {
+    try {
+      if (!file || !/^image\//i.test(file.type)) return resolve('')
+      const reader = new FileReader()
+      reader.onload = () => {
+        const img = new Image()
+        img.onload = () => {
+          const max = maxDim || 1280
+          let w = img.width, h = img.height
+          if (w > max || h > max) { const r = Math.min(max / w, max / h); w = Math.round(w * r); h = Math.round(h * r) }
+          const c = document.createElement('canvas')
+          c.width = w; c.height = h
+          const ctx = c.getContext('2d')
+          ctx.drawImage(img, 0, 0, w, h)
+          try { resolve(c.toDataURL('image/jpeg', quality || 0.72)) } catch (e) { resolve(String(reader.result || '')) }
+        }
+        img.onerror = () => resolve('')
+        img.src = String(reader.result || '')
+      }
+      reader.onerror = () => resolve('')
+      reader.readAsDataURL(file)
+    } catch (e) { resolve('') }
+  })
+}
+
 function viewPlanDetail(plan) {
   const u = currentUser()
-  if (!u) { toast('Please login to buy a plan', 'error'); location.hash = '#/auth'; return }
+  if (!u) { toast('Please login to buy a plan', 'error'); go('/auth'); return }
   buyPlanId = plan.id
   selectedMethod = null
 
@@ -595,7 +643,19 @@ function viewPlanDetail(plan) {
     '<h3>' + esc(plan.name) + ' - $' + plan.price + '/month</h3>' +
     '<p class="m-sub">' + esc(plan.tagline) + ' - ' + plan.daily + ' credits/day, ' + plan.agents + ' agents</p>' +
     '<ul class="plan-features">' + features + '</ul>' +
-    (plan.price > 0 ? '<div class="pay-row">' + methods + '</div><div class="pay-info" id="payInfo"><span class="small muted">Select a payment method</span></div><input type="text" id="trxInput" placeholder="Enter transaction ID / TX hash">' : '') +
+    (plan.price > 0
+      ? '<div class="pay-row">' + methods + '</div>' +
+        '<div class="pay-info" id="payInfo"><span class="small muted">Select a payment method</span></div>' +
+        '<div class="field"><label>Transaction ID / TX hash / Binance Order ID <span class="muted small">(optional if you upload a screenshot)</span></label>' +
+        '<input type="text" id="trxInput" placeholder="Enter transaction ID, TX hash or Binance Order ID"></div>' +
+        '<div class="field"><label>Payment screenshot <span class="muted small">(optional)</span></label>' +
+        '<div class="file-row"><label class="btn-file" for="proofFile">Choose file</label>' +
+        '<input type="file" id="proofFile" accept="image/*" class="hidden-file">' +
+        '<span id="proofFileName" class="muted small">No file chosen</span>' +
+        '<button class="btn btn-ghost btn-sm" id="proofClearBtn" type="button" hidden>Remove</button></div>' +
+        '<img id="proofPreview" class="pay-proof-preview" alt="screenshot preview" hidden></div>' +
+        '<p class="small muted">Submit with either the transaction/order ID, a screenshot, or both.</p>'
+      : '') +
     '<div class="modal-actions"><button class="btn btn-ghost" data-close-modal type="button">Cancel</button>' +
     '<button class="btn btn-primary" id="buyBtn" type="button">' + (plan.price === 0 ? 'Activate Free' : 'Buy Now - $' + plan.price) + '</button></div>'
   )
@@ -603,6 +663,29 @@ function viewPlanDetail(plan) {
   const infoEl = document.getElementById('payInfo')
   const trxEl = document.getElementById('trxInput')
   const buyBtn = document.getElementById('buyBtn')
+  let proofData = ''
+
+  const fileEl = document.getElementById('proofFile')
+  if (fileEl) fileEl.addEventListener('change', async () => {
+    const f = fileEl.files && fileEl.files[0]
+    if (!f) return
+    toast('Processing screenshot...', 'info')
+    proofData = await compressImageFile(f, 1280, 0.72)
+    const nameEl = document.getElementById('proofFileName')
+    const prev = document.getElementById('proofPreview')
+    const clr = document.getElementById('proofClearBtn')
+    if (nameEl) nameEl.textContent = f.name
+    if (prev && proofData) { prev.src = proofData; prev.hidden = false }
+    if (clr) clr.hidden = false
+  })
+  const clearBtn = document.getElementById('proofClearBtn')
+  if (clearBtn) clearBtn.addEventListener('click', () => {
+    proofData = ''
+    if (fileEl) fileEl.value = ''
+    const nameEl = document.getElementById('proofFileName'); if (nameEl) nameEl.textContent = 'No file chosen'
+    const prev = document.getElementById('proofPreview'); if (prev) { prev.hidden = true; prev.src = '' }
+    clearBtn.hidden = true
+  })
 
   document.querySelectorAll('[data-pay-method]').forEach(b => {
     b.addEventListener('click', () => {
@@ -616,23 +699,23 @@ function viewPlanDetail(plan) {
           '<div class="pay-number-row"><div class="pay-number">' + esc(m.number || '-') + '</div>' +
           (m.number ? '<button class="btn btn-primary btn-sm" data-copy-pay="' + esc(m.number) + '" type="button">Copy</button>' : '') + '</div>' +
           (m.note ? '<span class="small muted">' + esc(m.note) + '</span>' : '') +
-          (m.crypto ? '<div class="small muted mt-16">Crypto: paste your TX hash and we verify it on-chain automatically.</div>' : '<div class="small muted mt-16">Mobile/bank: send the exact amount, then paste your TrxID. Admin verifies and approves shortly.</div>')
+          (m.crypto ? '<div class="small muted mt-16">Send to the address above, then paste your order ID / TX hash or upload a screenshot.</div>' : '<div class="small muted mt-16">Send the exact amount, then paste your TrxID or upload a screenshot. Admin verifies and approves shortly.</div>')
       }
     })
   })
 
   if (buyBtn) {
     buyBtn.addEventListener('click', () => {
-      if (plan.price === 0) { buyPackage(plan, null, ''); return }
+      if (plan.price === 0) { buyPackage(plan, null, '', '', ''); return }
       if (!selectedMethod) { toast('Please select a payment method', 'error'); return }
       const trx = trxEl ? trxEl.value.trim() : ''
-      if (!trx) { toast('Please enter your transaction ID', 'error'); return }
-      buyPackage(plan, selectedMethod, trx)
+      if (!trx && !proofData) { toast('Enter a transaction/order ID or upload a screenshot', 'error'); return }
+      buyPackage(plan, selectedMethod, trx, trx, proofData)
     })
   }
 }
 
-function buyPackage(plan, method, trx) {
+function buyPackage(plan, method, trx, orderId, proofImage) {
   const u = currentUser()
   if (!u) { toast('Please login', 'error'); return }
   const payments = store.payments()
@@ -647,15 +730,26 @@ function buyPackage(plan, method, trx) {
     method: method ? method.name : 'instant',
     methodId: method ? method.id : 'free',
     trx: trx || '',
+    orderId: orderId || '',
+    proofImage: proofImage || '',
     status: 'pending',
     createdAt: new Date().toISOString(),
     autoApproved: false
   }
   if (plan.price === 0) payment.status = 'approved'
-  else if (method && method.crypto) payment.status = 'auto_verifying'
+  else if (method && method.crypto && !proofImage) payment.status = 'auto_verifying'
   payments.push(payment)
   store.savePayments(payments)
   closeModal()
+
+  if (plan.price > 0) {
+    apiPost('/api/payment/proof', {
+      email: u.email, name: u.name, plan: plan.id, planName: plan.name, amount: plan.price,
+      method: method ? method.name : '', methodId: method ? method.id : '',
+      trx: trx || '', orderId: orderId || '', proofImage: proofImage || ''
+    }).then(res => { if (res && res.status === 'Real') toast('Payment proof sent for review.', 'success') })
+      .catch(() => {})
+  }
 
   if (payment.status === 'approved') {
     activatePremium(u.email, plan, id)
@@ -684,7 +778,7 @@ async function verifyCryptoPayment(id, method, trx, plan) {
     } else {
       toast(message || 'Transaction not confirmed yet. Admin will review shortly.', 'info')
     }
-    if ((location.hash || '').indexOf('#/dashboard') === 0) navigate()
+    if (pathFromLocation() === '/dashboard') navigate()
   }
   try {
     const res = await apiPost('/api/crypto/verify', {
@@ -750,11 +844,74 @@ function localMetaDescriptions(primary, year) {
 
 const state = { activeTool: null, adminTab: 'users', adminChatId: null, authMode: 'login', adminError: '' }
 
+const ROUTES = ['/', '/generator', '/tools', '/pricing', '/dashboard', '/admin', '/auth']
+
+const ROUTE_META = {
+  '/': { title: 'SEO Service Provider - Free SEO Tools & AI Agents', desc: 'Free SEO tools and AI agents with real analysis. Title generator, keyword research, SERP analyzer, rank tracking and more.' },
+  '/generator': { title: 'Free SEO Title Generator - 10 AI Titles with Scores', desc: 'Generate 10 click-worthy SEO titles from one primary keyword, each scored for length, power words and search intent. Free to try.' },
+  '/tools': { title: 'Free SEO Tools - Keyword, SERP, PageSpeed & SEO Audit', desc: 'Run real SEO analysis: keyword research, SERP analyzer, competitor analysis, People-Also-Ask questions, PageSpeed and a full SEO audit.' },
+  '/pricing': { title: 'Pricing & Plans - SEO Service Provider', desc: 'Simple SEO plans for freelancers and agencies. Unlock more AI agents, higher daily credits and priority usage. Pay by mobile, bank or crypto.' },
+  '/dashboard': { title: 'Dashboard - SEO Service Provider', desc: 'Your SEO dashboard: run AI agents, read reports and manage your plan.' },
+  '/admin': { title: 'Admin - SEO Service Provider', desc: 'Restricted admin panel.' },
+  '/auth': { title: 'Login or Register - SEO Service Provider', desc: 'Create a free account or sign in to run SEO tools and AI agents.' }
+}
+
+function pathFromLocation() {
+  const h = location.hash || ''
+  if (h.indexOf('#/') === 0) return h.replace(/^#/, '') || '/'
+  let p = '/'
+  try { p = decodeURIComponent(location.pathname || '/') } catch (e) { p = '/' }
+  p = p.replace(/\/+$/, '') || '/'
+  if (p !== '/' && ROUTES.indexOf(p) < 0) return '/'
+  return p
+}
+
+function applyRouteMeta(path) {
+  const meta = ROUTE_META[path] || ROUTE_META['/']
+  document.title = meta.title
+  const set = (sel, attr, val) => { const el = document.querySelector(sel); if (el) el.setAttribute(attr, val) }
+  set('meta[name="description"]', 'content', meta.desc)
+  set('meta[property="og:title"]', 'content', meta.title)
+  set('meta[property="og:description"]', 'content', meta.desc)
+  set('meta[name="twitter:title"]', 'content', meta.title)
+  set('meta[name="twitter:description"]', 'content', meta.desc)
+  const origin = location.origin + '/'
+  const url = origin + (path === '/' ? '' : path.replace(/^\//, ''))
+  set('link[rel="canonical"]', 'href', url)
+  set('meta[property="og:url"]', 'content', url)
+}
+
+function go(path, replace) {
+  if (ROUTES.indexOf(path) < 0) path = '/'
+  try {
+    if (replace) history.replaceState({}, '', path)
+    else history.pushState({}, '', path)
+  } catch (e) { location.hash = '#' + path }
+  navigate()
+}
+
+function onInternalLinkClick(e) {
+  if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+  const a = e.target && e.target.closest ? e.target.closest('a[href]') : null
+  if (!a || a.target === '_blank' || a.hasAttribute('download')) return
+  const href = a.getAttribute('href') || ''
+  if (href.indexOf('#/') === 0) { e.preventDefault(); go(href.replace(/^#/, '')); return }
+  if (href.charAt(0) === '/' && href.indexOf('//') !== 0) {
+    const path = href.replace(/[?#].*$/, '').replace(/\/+$/, '') || '/'
+    if (ROUTES.indexOf(path) < 0) return
+    e.preventDefault(); go(path)
+  }
+}
+
 function navigate() {
-  const path = (location.hash || '#/').replace(/^#/, '') || '/'
+  const path = pathFromLocation()
+  if ((location.hash || '').indexOf('#/') === 0) {
+    try { history.replaceState({}, '', path) } catch (e) {}
+  }
   const view = document.getElementById('mainView')
   if (!view) return
   const cu = currentUser()
+  applyRouteMeta(path)
   if (cu && cu.blocked && !isAdmin(cu.email)) {
     view.innerHTML = blockedView(cu)
     updateAuthUI()
@@ -771,8 +928,9 @@ function navigate() {
 }
 
 function markActiveLink(path) {
-  document.querySelectorAll('.nav-links a').forEach(a => {
-    a.classList.toggle('active', (a.getAttribute('href') || '').replace('#', '') === path)
+  document.querySelectorAll('.nav-links a, .mobile-links a').forEach(a => {
+    const h = (a.getAttribute('href') || '').replace(/^#/, '')
+    a.classList.toggle('active', h === path)
   })
 }
 
@@ -780,8 +938,8 @@ function updateAuthUI() {
   const u = currentUser()
   const btn = document.getElementById('authBtn')
   const mob = document.getElementById('mobileAuthBtn')
-  if (btn) { btn.textContent = u ? 'Hi, ' + u.name.split(' ')[0] : 'Login'; btn.href = u ? '#/dashboard' : '#/auth' }
-  if (mob) { mob.textContent = u ? 'Hi, ' + u.name.split(' ')[0] : 'Login / Register'; mob.href = u ? '#/dashboard' : '#/auth' }
+  if (btn) { btn.textContent = u ? 'Hi, ' + u.name.split(' ')[0] : 'Login'; btn.href = u ? '/dashboard' : '/auth' }
+  if (mob) { mob.textContent = u ? 'Hi, ' + u.name.split(' ')[0] : 'Login / Register'; mob.href = u ? '/dashboard' : '/auth' }
 }
 
 /* ---------- home ---------- */
@@ -806,8 +964,8 @@ function homeView() {
       '<h1>Free SEO Tools & <span class="grad">AI Agents</span> that rank</h1>' +
       '<p class="lead">Real SERP data, real PageSpeed scores and real rankings. 19 agents, 10 tools and 12 payment methods - all MIT self-hosted, free forever.</p>' +
       '<div class="hero-cta">' +
-        '<a href="#/generator" class="btn btn-primary">Try Title Generator</a>' +
-        '<a href="#/tools" class="btn btn-ghost">Explore 10 Tools</a>' +
+        '<a href="/generator" class="btn btn-primary">Try Title Generator</a>' +
+        '<a href="/tools" class="btn btn-ghost">Explore 10 Tools</a>' +
       '</div>' +
       '<div class="hero-stats">' +
         '<div class="stat-card"><b>19</b><span>AI Agents</span></div>' +
@@ -830,7 +988,7 @@ function homeView() {
     '<section class="section container">' +
       '<div class="section-head"><span class="eyebrow">How it works</span><h2>From zero to Premium in 4 steps</h2></div>' +
       '<div class="grid grid-4">' +
-        '<div class="feature-card"><div class="f-icon">1</div><h3>Register</h3><p>Create a free account at #/auth - takes seconds.</p></div>' +
+        '<div class="feature-card"><div class="f-icon">1</div><h3>Register</h3><p>Create a free account at /auth - takes seconds.</p></div>' +
         '<div class="feature-card"><div class="f-icon">2</div><h3>Generate</h3><p>Build 15 real SEO titles from live SERP data.</p></div>' +
         '<div class="feature-card"><div class="f-icon">3</div><h3>Buy Starter</h3><p>$5 via bKash, Nagad or crypto. Crypto auto-verifies.</p></div>' +
         '<div class="feature-card"><div class="f-icon">4</div><h3>Go Premium</h3><p>Unlock 12-19 agents, daily credits and rank tracking.</p></div>' +
@@ -854,7 +1012,7 @@ function generatorView() {
   if (!u) {
     return '<div class="section container auth-wrap"><div class="form-card center">' +
       '<h2>Login to generate</h2><p class="sub">Title generation saves real reports to your dashboard.</p>' +
-      '<a href="#/auth" class="btn btn-primary">Login / Register</a></div></div>'
+      '<a href="/auth" class="btn btn-primary">Login / Register</a></div></div>'
   }
   return '<div class="section container">' +
     '<div class="section-head"><span class="eyebrow">Title Generator</span><h2>Generate 15 real SEO titles</h2><p>Real SERP analysis drives meaningful words, intent and niche competitors - titles are never random templates.</p></div>' +
@@ -948,7 +1106,7 @@ function openAgent(agentName) {
   const tool = TOOLS.find(t => t.id === toolId)
   if (!tool) return
   state.activeTool = toolId
-  location.hash = '#/tools'
+  go('/tools')
   toast(agentName + ' opened: ' + tool.name)
 }
 
@@ -1296,7 +1454,7 @@ function pricingView() {
 function dashboardView() {
   const u = currentUser()
   if (!u) {
-    return '<div class="section container auth-wrap"><div class="form-card center"><h2>Login required</h2><p class="sub">Sign in to view your dashboard.</p><a href="#/auth" class="btn btn-primary">Login / Register</a></div></div>'
+    return '<div class="section container auth-wrap"><div class="form-card center"><h2>Login required</h2><p class="sub">Sign in to view your dashboard.</p><a href="/auth" class="btn btn-primary">Login / Register</a></div></div>'
   }
   const premium = u.premium && u.premium.status === 'Active' ? u.premium : null
   const agentsUnlocked = premium ? premium.agents : 3
@@ -1312,7 +1470,7 @@ function dashboardView() {
 
   const myReports = reports.length ? reports.map(r =>
     '<div class="title-item"><div class="t-top"><div class="t-title">' + esc(r.primary) + ' <span class="muted small">' + r.titleCount + ' titles - ' + esc(r.intent) + ' intent</span></div><div class="t-actions"><span class="muted small">' + fmtTime(r.date) + '</span><button class="btn btn-ghost btn-sm" data-view-report="' + r.id + '" type="button">View</button></div></div></div>').join('')
-    : '<div class="muted small">No reports yet. Try the <a href="#/generator" style="color:var(--primary-2)">Title Generator</a>.</div>'
+    : '<div class="muted small">No reports yet. Try the <a href="/generator" style="color:var(--primary-2)">Title Generator</a>.</div>'
 
   const myPayments = store.payments().filter(p => p.email === u.email).map(p =>
     '<tr><td>' + esc(p.id) + '</td><td>' + esc(p.planName) + '</td><td>$' + p.amount + '</td><td>' + esc(p.method) + '</td><td>' + esc(p.trx) + '</td><td>' + fmtDate(p.createdAt) + '</td><td>' + statusPill(p.status) + '</td></tr>').join('')
@@ -1393,21 +1551,48 @@ function adminView() {
   const unreadTotal = store.chats().reduce((a, c) => a + (c.adminUnread || 0), 0)
   const trashCount = trashedUsers().length
   const premiumCount = premiumUsers().length
-  const tabs = [
+  const role = adminRole()
+  const isOwner = role === 'admin'
+  const ownerTabs = [
     ['users', 'Users'],
     ['premium', 'Premium' + (premiumCount ? ' (' + premiumCount + ')' : '')],
     ['trash', 'Trash' + (trashCount ? ' (' + trashCount + ')' : '')],
     ['payments', 'Payments'],
+    ['plans', 'Plans'],
+    ['methods', 'Payment Methods'],
     ['chats', 'Live Chat' + (unreadTotal ? ' (' + unreadTotal + ')' : '')],
+    ['logs', 'System Logs'],
+    ['audit', 'Audit Logs'],
+    ['moderators', 'Moderators'],
     ['account', 'Account & Security'],
+    ['maintenance', 'Maintenance'],
     ['dev', 'Development']
   ]
+  const moderatorTabs = [
+    ['logs', 'System Logs'],
+    ['chats', 'Live Chat' + (unreadTotal ? ' (' + unreadTotal + ')' : '')]
+  ]
+  const tabs = isOwner ? ownerTabs : moderatorTabs
+  const allowed = tabs.map(t => t[0])
+  if (allowed.indexOf(state.adminTab) < 0) state.adminTab = allowed[0]
   const tabHtml = tabs.map(([id, label]) => '<button class="tab' + (state.adminTab === id ? ' active' : '') + '" data-atab="' + id + '" type="button">' + label + '</button>').join('')
+  const roleBadge = isOwner
+    ? '<span class="label-pill label-veryhigh">OWNER</span>'
+    : '<span class="label-pill label-good">MODERATOR</span>'
   return '<div class="section container">' +
-    '<div class="section-head"><span class="eyebrow">Admin Panel</span><h2>Manage your platform</h2></div>' +
+    '<div class="section-head"><span class="eyebrow">Admin Panel</span><h2>Manage your platform ' + roleBadge + '</h2>' +
+    (isOwner ? '' : '<p class="small muted mt-8">Moderator access is limited to System Logs and Live Chat.</p>') +
+    '</div>' +
     '<div class="tabs">' + tabHtml + '</div>' +
     '<div class="panel" id="adminTab">' + adminTabContent() + '</div>' +
     '</div>'
+}
+
+function aField(label, id, type, ph) {
+  return '<div class="field"><label>' + label + '</label><input type="' + (type || 'text') + '" id="' + id + '" placeholder="' + (ph || '') + '"></div>'
+}
+function permDenied() {
+  return '<h3>Not available</h3><p class="small muted mt-8">Your role does not have permission to view this section.</p>'
 }
 
 function adminTabContent() {
@@ -1429,6 +1614,15 @@ function adminTabContent() {
     }).join('')
     return '<h3>Users (' + list.length + ')</h3>' +
       (blockedUsers().length ? '<p class="small muted mt-16">' + blockedUsers().length + ' blocked account(s). Blocked users cannot login or use any tool.</p>' : '') +
+      '<div class="form-card mt-16"><h4>Create a user</h4>' +
+      '<p class="small muted">Creates a real login account (email confirmed) with the password you set.</p>' +
+      '<div class="grid grid-3" style="gap:12px">' +
+        aField('Full name', 'newUserName', 'text', 'User name') +
+        aField('Email', 'newUserEmail', 'email', 'user@example.com') +
+        aField('Password (min 8)', 'newUserPass', 'password', 'Temporary password') +
+      '</div>' +
+      '<button class="btn btn-primary" id="newUserBtn" type="button">Create user</button>' +
+      '<div id="newUserMsg" class="mt-8"></div></div>' +
       '<div class="table-wrap mt-16"><table class="table"><thead><tr><th>Name</th><th>Email</th><th>Joined</th><th>Plan</th><th>Role</th><th>Status</th><th>Action</th></tr></thead><tbody>' +
       (rows || '<tr><td colspan="7" class="muted">No users yet</td></tr>') + '</tbody></table></div>'
   }
@@ -1474,10 +1668,101 @@ function adminTabContent() {
       (userRows || '<tr><td colspan="6" class="muted">No premium users yet</td></tr>') + '</tbody></table></div>'
   }
   if (state.adminTab === 'payments') {
-    const rows = store.payments().map(p =>
-      '<tr><td>' + esc(p.id) + '</td><td>' + esc(p.name) + '<br><span class="muted small">' + esc(p.email) + '</span></td><td>' + esc(p.planName) + ' - $' + p.amount + '</td><td>' + esc(p.method) + '<br><span class="muted small">' + esc(p.trx) + '</span></td><td>' + fmtDate(p.createdAt) + '</td><td>' + statusPill(p.status) + '</td><td>' +
-      (p.status === 'pending' || p.status === 'auto_verifying' ? '<div class="flex"><button class="btn btn-success btn-sm" data-approve-pay="' + p.id + '" type="button">Approve</button><button class="btn btn-danger btn-sm" data-reject-pay="' + p.id + '" type="button">Reject</button></div>' : '<span class="muted small">-</span>') + '</td></tr>').join('')
-    return '<h3>Payments (' + store.payments().length + ')</h3><div class="table-wrap mt-16"><table class="table"><thead><tr><th>ID</th><th>Customer</th><th>Plan</th><th>Method</th><th>Date</th><th>Status</th><th>Action</th></tr></thead><tbody>' + (rows || '<tr><td colspan="7" class="muted">No payments yet</td></tr>') + '</tbody></table></div>'
+    const rows = store.payments().map(p => {
+      const proof = p.proofImage ? '<br><img src="' + esc(p.proofImage) + '" alt="payment screenshot" class="pay-proof-thumb" data-open-proof="' + p.id + '">' : ''
+      const ids = [p.trx ? 'Trx: ' + esc(p.trx) : '', p.orderId ? 'Order: ' + esc(p.orderId) : ''].filter(Boolean).join(' | ') || '<span class="muted">no reference</span>'
+      return '<tr><td>' + esc(p.id) + '</td><td>' + esc(p.name) + '<br><span class="muted small">' + esc(p.email) + '</span></td><td>' + esc(p.planName) + ' - $' + p.amount + '</td><td>' + esc(p.method) + '<br><span class="muted small">' + ids + '</span>' + proof + '</td><td>' + fmtDate(p.createdAt) + '</td><td>' + statusPill(p.status) + '</td><td>' +
+        (p.status === 'pending' || p.status === 'auto_verifying' ? '<div class="flex"><button class="btn btn-success btn-sm" data-approve-pay="' + p.id + '" type="button">Approve</button><button class="btn btn-danger btn-sm" data-reject-pay="' + p.id + '" type="button">Reject</button></div>' : '<span class="muted small">-</span>') + '</td></tr>'
+    }).join('')
+    return '<h3>Payments (' + store.payments().length + ')</h3>' +
+      '<p class="small muted mt-8">Users may submit a Binance order ID, a transaction hash, or a payment screenshot (any one is enough). Review server-submitted proofs below.</p>' +
+      '<div class="table-wrap mt-16"><table class="table"><thead><tr><th>ID</th><th>Customer</th><th>Plan</th><th>Method &amp; proof</th><th>Date</th><th>Status</th><th>Action</th></tr></thead><tbody>' + (rows || '<tr><td colspan="7" class="muted">No payments yet</td></tr>') + '</tbody></table></div>' +
+      '<h4 class="mt-24">Submitted proofs</h4>' +
+      '<div id="adminProofs" class="mt-8"><span class="muted small">Loading proofs...</span></div>'
+  }
+  if (state.adminTab === 'plans') {
+    if (adminRole() !== 'admin') return permDenied()
+    return '<h3>Plans Management</h3>' +
+      '<p class="small muted mt-8">Create, edit and delete subscription plans. Inactive plans are hidden from the storefront.</p>' +
+      '<div class="form-card mt-16"><h4 id="planFormTitle">Add a plan</h4>' +
+      '<input type="hidden" id="planId">' +
+      '<div class="grid grid-2" style="gap:12px">' +
+        aField('Plan name', 'planName', 'text', 'e.g. Studio') +
+        aField('Price', 'planPrice', 'number', '0') +
+        aField('Currency', 'planCurrency', 'text', 'BDT') +
+        aField('Agents', 'planAgents', 'number', '1') +
+        aField('Daily credits', 'planDaily', 'number', '10') +
+        aField('Monthly credits', 'planMonthly', 'number', '100') +
+        aField('Badge (optional)', 'planBadge', 'text', 'Most popular') +
+        aField('Sort order', 'planSort', 'number', '1') +
+      '</div>' +
+      '<div class="field"><label>Features (one per line)</label><textarea id="planFeatures" rows="3" placeholder="Unlimited tools&#10;Priority support"></textarea></div>' +
+      '<div class="field"><label><input type="checkbox" id="planActive" checked> Active (visible on pricing)</label></div>' +
+      '<div class="input-row"><button class="btn btn-primary" id="planSaveBtn" type="button">Save plan</button>' +
+      '<button class="btn btn-ghost" id="planResetBtn" type="button">New / clear form</button></div>' +
+      '<div id="planMsg" class="mt-8"></div></div>' +
+      '<div id="adminPlansList" class="mt-16"><span class="muted small">Loading plans...</span></div>'
+  }
+  if (state.adminTab === 'methods') {
+    if (adminRole() !== 'admin') return permDenied()
+    return '<h3>Payment Methods</h3>' +
+      '<p class="small muted mt-8">Add, enable/disable or delete payment gateways shown at checkout (bKash, Nagad, Bank, Binance Pay, crypto).</p>' +
+      '<div class="form-card mt-16"><h4 id="pmFormTitle">Add a payment method</h4>' +
+      '<input type="hidden" id="pmId">' +
+      '<div class="grid grid-2" style="gap:12px">' +
+        aField('Label', 'pmLabel', 'text', 'e.g. Binance Pay') +
+        aField('Number / ID / address', 'pmNumber', 'text', 'Pay ID or wallet address') +
+        aField('Network', 'pmNetwork', 'text', 'e.g. BEP20') +
+        aField('Sort order', 'pmSort', 'number', '1') +
+      '</div>' +
+      '<div class="field"><label>Note / instructions</label><textarea id="pmNote" rows="2"></textarea></div>' +
+      '<div class="field"><label><input type="checkbox" id="pmCrypto"> Crypto (auto-verify attempt)</label> ' +
+      '<label class="ml-16"><input type="checkbox" id="pmEnabled" checked> Enabled</label></div>' +
+      '<div class="input-row"><button class="btn btn-primary" id="pmSaveBtn" type="button">Save method</button>' +
+      '<button class="btn btn-ghost" id="pmResetBtn" type="button">New / clear form</button></div>' +
+      '<div id="pmMsg" class="mt-8"></div></div>' +
+      '<div id="adminMethodsList" class="mt-16"><span class="muted small">Loading methods...</span></div>'
+  }
+  if (state.adminTab === 'moderators') {
+    if (adminRole() !== 'admin') return permDenied()
+    return '<h3>Manage Moderators</h3>' +
+      '<p class="small muted mt-8">Moderators can ONLY view System Logs and reply in Live Chat. They cannot access Plans, Payment Methods, Audit Logs, Users or Maintenance.</p>' +
+      '<div class="form-card mt-16"><h4>Create a moderator</h4>' +
+      '<div class="grid grid-2" style="gap:12px">' +
+        aField('Full name', 'modName', 'text', 'Moderator name') +
+        aField('Email', 'modEmail', 'email', 'mod@example.com') +
+        aField('Password (min 8)', 'modPassword', 'password', 'Temporary password') +
+      '</div>' +
+      '<button class="btn btn-primary" id="modCreateBtn" type="button">Create moderator</button>' +
+      '<div id="modMsg" class="mt-8"></div></div>' +
+      '<div id="adminModsList" class="mt-16"><span class="muted small">Loading moderators...</span></div>'
+  }
+  if (state.adminTab === 'logs') {
+    return '<h3>System Logs</h3>' +
+      '<p class="small muted mt-8">Background job results (title generation, SERP, PageSpeed, SEO audit, AI chat) and system errors. <span id="logConcurrency"></span></p>' +
+      '<div class="input-row mt-16"><button class="btn btn-ghost btn-sm" id="logsRefreshBtn" type="button">Refresh</button>' +
+      (adminRole() === 'admin' ? '<button class="btn btn-danger btn-sm" id="logsClearBtn" type="button">Clear system logs</button>' : '') +
+      '</div><div id="adminLogs" class="mt-16"><span class="muted small">Loading logs...</span></div>'
+  }
+  if (state.adminTab === 'audit') {
+    if (adminRole() !== 'admin') return permDenied()
+    return '<h3>Audit Logs</h3>' +
+      '<p class="small muted mt-8">Security history: admin/moderator logins, settings changes, plan/payment-method updates, moderator management and backup creation.</p>' +
+      '<div class="input-row mt-16"><button class="btn btn-ghost btn-sm" id="auditRefreshBtn" type="button">Refresh</button>' +
+      '<button class="btn btn-danger btn-sm" id="auditClearBtn" type="button">Clear audit logs</button></div>' +
+      '<div id="adminAudit" class="mt-16"><span class="muted small">Loading audit logs...</span></div>'
+  }
+  if (state.adminTab === 'maintenance') {
+    if (adminRole() !== 'admin') return permDenied()
+    return '<h3>Maintenance Mode</h3>' +
+      '<p class="small muted mt-8">Take the public site offline for non-admins, pause new registrations, and cap how many heavy jobs run at once.</p>' +
+      '<div class="form-card mt-16">' +
+        '<div class="field"><label><input type="checkbox" id="mtMaintenance"> Enable maintenance mode (blocks all non-admin API and shows a notice)</label></div>' +
+        '<div class="field"><label><input type="checkbox" id="mtRegistrations" checked> Allow new user registrations</label></div>' +
+        '<div class="field"><label>Max concurrent background jobs (1-64)</label><input type="number" id="mtConcurrency" min="1" max="64" value="8"></div>' +
+        '<button class="btn btn-primary" id="mtSaveBtn" type="button">Save settings</button>' +
+        '<div id="mtMsg" class="mt-8"></div>' +
+      '</div>'
   }
   if (state.adminTab === 'account') {
     return '<h3>Account &amp; Security</h3>' +
@@ -1510,25 +1795,18 @@ function adminTabContent() {
   if (state.adminTab === 'dev') {
     return devAdminContent()
   }
-  // chats
-  const chats = store.chats().slice().sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''))
-  const list = chats.length ? chats.map(c =>
-    '<div class="chat-thread" data-open-thread="' + c.id + '" style="cursor:pointer">' +
-      '<h4>' + esc(c.name || c.email) + (c.adminUnread ? ' <span class="label-pill label-good">' + c.adminUnread + ' new</span>' : '') + '</h4>' +
-      '<div class="ct-meta">' + esc(c.email) + ' - last message ' + (c.updatedAt ? fmtTime(c.updatedAt) : '') + '</div>' +
-      '<div class="muted small">' + esc((c.messages[c.messages.length - 1] || {}).text || '') + '</div>' +
-    '</div>').join('') : '<div class="muted small">No conversations yet.</div>'
-
-  const open = store.chats().find(c => c.id === state.adminChatId)
-  if (open) {
-    const msgs = open.messages.map(m =>
-      '<div class="msg msg-' + m.from + '">' + esc(m.text) + '<span class="msg-time">' + fmtTime(m.time) + '</span></div>').join('')
-    return '<button class="btn btn-ghost btn-sm" data-back-thread type="button">Back to threads</button>' +
-      '<div class="chat-thread mt-16"><h4>' + esc(open.name || open.email) + '</h4><div class="ct-meta">' + esc(open.email) + '</div>' +
-      '<div class="mt-16" style="max-height:280px;overflow-y:auto">' + msgs + '</div>' +
-      '<div class="input-row mt-16"><input type="text" id="adminReplyInput" placeholder="Reply as admin..."><button class="btn btn-primary" data-send-reply="' + open.id + '" type="button">Send</button></div></div>'
+  if (state.adminTab === 'chats') {
+    const broadcast = adminRole() === 'admin'
+      ? '<div class="form-card mt-16"><h4>Broadcast to all users</h4>' +
+        '<div class="field"><label>Message</label><textarea id="broadcastText" rows="2" placeholder="Message every user in live chat"></textarea></div>' +
+        '<button class="btn btn-primary" id="broadcastBtn" type="button">Send to all users</button><div id="broadcastMsg" class="mt-8"></div></div>'
+      : ''
+    return '<h3>Live Chat</h3>' +
+      '<p class="small muted mt-8">Reply to every user individually. The AI assistant answers instantly with website information, and human support is on WhatsApp 01883822816.</p>' +
+      broadcast +
+      '<div id="adminChats" class="mt-16"><span class="muted small">Loading conversations...</span></div>'
   }
-  return '<h3>Live Chat</h3><div class="chat-list mt-16">' + list + '</div>'
+  return '<div class="muted">Select a tab.</div>'
 }
 
 /* ---------- admin account & security ---------- */
@@ -1601,6 +1879,347 @@ function bindAdminAccount() {
   })
 
   adminAccountLoad()
+}
+
+/* ---------- admin: plans / payment methods / moderators / logs / settings ---------- */
+
+function aMsg(id, text, ok) {
+  const el = document.getElementById(id)
+  if (el) el.innerHTML = text ? '<div class="alert ' + (ok ? 'alert-info' : 'alert-error') + '">' + esc(text) + '</div>' : ''
+}
+
+function levelPill(level) {
+  const map = { success: 'label-good', info: 'label-medium', warn: 'label-high', error: 'label-veryhigh' }
+  return '<span class="label-pill ' + (map[level] || 'label-medium') + '">' + esc(String(level || 'info').toUpperCase()) + '</span>'
+}
+
+async function bindAdminProofs() {
+  const box = document.getElementById('adminProofs')
+  if (!box) return
+  const res = await apiAdmin('/api/admin/payment-proofs', null, 'GET')
+  if (!res || res.status !== 'Real') { box.innerHTML = '<span class="muted small">' + esc((res && res.error) || 'Could not load proofs.') + '</span>'; return }
+  const list = res.proofs || []
+  if (!list.length) { box.innerHTML = '<span class="muted small">No server proofs submitted yet.</span>'; return }
+  box.innerHTML = '<div class="table-wrap"><table class="table"><thead><tr><th>Customer</th><th>Plan</th><th>Method</th><th>Order ID / Trx</th><th>Proof</th><th>Status</th><th>Action</th></tr></thead><tbody>' +
+    list.map(p =>
+      '<tr><td>' + esc(p.name || '') + '<br><span class="muted small">' + esc(p.email) + '</span></td><td>' + esc(p.planName || p.plan || '') + ' - $' + (p.amount || 0) + '</td><td>' + esc(p.method || '') + '</td><td>' + (p.orderId ? esc(p.orderId) : '<span class="muted small">-</span>') + (p.trx ? '<br><span class="muted small">' + esc(p.trx) + '</span>' : '') + '</td><td>' + (p.proofImage ? '<img src="' + esc(p.proofImage) + '" class="pay-proof-thumb" alt="payment screenshot">' : '<span class="muted small">none</span>') + '</td><td>' + statusPill(p.status === 'approved' ? 'approved' : (p.status === 'rejected' ? 'rejected' : 'pending')) + '</td><td>' +
+      (p.status === 'pending'
+        ? '<div class="flex"><button class="btn btn-success btn-sm" data-proof-approve="' + p.id + '" type="button">Approve</button><button class="btn btn-danger btn-sm" data-proof-reject="' + p.id + '" type="button">Reject</button></div>'
+        : '<span class="muted small">' + esc(p.reviewedAt ? fmtDate(p.reviewedAt) : '-') + '</span>') + '</td></tr>').join('') +
+    '</tbody></table></div>'
+  box.querySelectorAll('[data-proof-approve]').forEach(b => b.addEventListener('click', () => reviewProof(b.getAttribute('data-proof-approve'), 'approved')))
+  box.querySelectorAll('[data-proof-reject]').forEach(b => b.addEventListener('click', () => reviewProof(b.getAttribute('data-proof-reject'), 'rejected')))
+}
+
+async function reviewProof(id, status) {
+  const res = await apiAdmin('/api/admin/payment-proofs/' + encodeURIComponent(id), { status }, 'PATCH')
+  toast((res && (res.error || ('Payment proof ' + status))) || 'Done', res && res.status === 'Real' ? 'success' : 'error')
+  bindAdminProofs()
+}
+
+/* ----- plans ----- */
+async function loadAdminPlans() {
+  const box = document.getElementById('adminPlansList')
+  if (!box) return
+  const res = await apiAdmin('/api/admin/plans', null, 'GET')
+  if (!res || res.status !== 'Real') { box.innerHTML = '<span class="muted small">' + esc((res && res.error) || 'Could not load plans.') + '</span>'; return }
+  window.__adminPlans = res.plans || []
+  if (!window.__adminPlans.length) { box.innerHTML = '<span class="muted small">No custom plans yet. The storefront uses its built-in defaults until you add one here.</span>'; return }
+  box.innerHTML = '<div class="table-wrap"><table class="table"><thead><tr><th>Name</th><th>Price</th><th>Agents</th><th>Daily</th><th>Monthly</th><th>Active</th><th>Action</th></tr></thead><tbody>' +
+    window.__adminPlans.map(p => '<tr><td>' + esc(p.name) + (p.badge ? ' <span class="label-pill label-good">' + esc(p.badge) + '</span>' : '') + '</td><td>' + esc(p.currency || 'BDT') + ' ' + p.price + '</td><td>' + p.agents + '</td><td>' + p.daily + '</td><td>' + p.monthly + '</td><td>' + (p.active !== false ? 'yes' : 'no') + '</td><td><div class="flex"><button class="btn btn-ghost btn-sm" data-plan-edit="' + esc(p.id) + '" type="button">Edit</button><button class="btn btn-danger btn-sm" data-plan-del="' + esc(p.id) + '" type="button">Delete</button></div></td></tr>').join('') +
+    '</tbody></table></div>'
+}
+
+function fillPlanForm(p) {
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v }
+  const chk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v }
+  document.getElementById('planFormTitle').textContent = 'Edit plan'
+  set('planId', p.id); set('planName', p.name); set('planPrice', p.price); set('planCurrency', p.currency || 'BDT')
+  set('planAgents', p.agents); set('planDaily', p.daily); set('planMonthly', p.monthly); set('planBadge', p.badge || '')
+  set('planSort', p.sort || 1); set('planFeatures', (p.features || []).join('\n')); chk('planActive', p.active !== false)
+}
+
+function resetPlanForm() {
+  ['planId', 'planName', 'planPrice', 'planAgents', 'planDaily', 'planMonthly', 'planBadge', 'planFeatures'].forEach(id => { const el = document.getElementById(id); if (el) el.value = '' })
+  const c = document.getElementById('planCurrency'); if (c) c.value = 'BDT'
+  const s = document.getElementById('planSort'); if (s) s.value = '1'
+  const a = document.getElementById('planActive'); if (a) a.checked = true
+  const t = document.getElementById('planFormTitle'); if (t) t.textContent = 'Add a plan'
+}
+
+function bindAdminPlans() {
+  loadAdminPlans()
+  const save = document.getElementById('planSaveBtn')
+  if (save) save.addEventListener('click', async () => {
+    const val = id => ((document.getElementById(id) || {}).value || '').trim()
+    const body = {
+      id: val('planId') || undefined,
+      name: val('planName'),
+      price: Number(val('planPrice')) || 0,
+      currency: val('planCurrency') || 'BDT',
+      agents: Number(val('planAgents')) || 1,
+      daily: Number(val('planDaily')) || 10,
+      monthly: Number(val('planMonthly')) || 100,
+      badge: val('planBadge'),
+      sort: Number(val('planSort')) || 1,
+      features: ((document.getElementById('planFeatures') || {}).value || '').split('\n').map(s => s.trim()).filter(Boolean),
+      active: !!(document.getElementById('planActive') || {}).checked
+    }
+    const res = await apiAdmin('/api/admin/plans', body)
+    aMsg('planMsg', res && (res.error || ('Saved plan "' + ((res.plan || {}).name || body.name) + '".')), res && res.status === 'Real')
+    if (res && res.status === 'Real') { resetPlanForm(); loadAdminPlans() }
+  })
+  const reset = document.getElementById('planResetBtn'); if (reset) reset.addEventListener('click', resetPlanForm)
+  const box = document.getElementById('adminPlansList')
+  if (box) box.addEventListener('click', async e => {
+    const eb = e.target.closest('[data-plan-edit]')
+    if (eb) { const p = (window.__adminPlans || []).find(x => x.id === eb.getAttribute('data-plan-edit')); if (p) fillPlanForm(p); return }
+    const db = e.target.closest('[data-plan-del]')
+    if (db && confirm('Delete this plan?')) {
+      const res = await apiAdmin('/api/admin/plans/' + encodeURIComponent(db.getAttribute('data-plan-del')), null, 'DELETE')
+      toast((res && (res.error || 'Plan deleted')) || 'Done', res && res.status === 'Real' ? 'success' : 'error')
+      loadAdminPlans()
+    }
+  })
+}
+
+/* ----- payment methods ----- */
+async function loadAdminMethods() {
+  const box = document.getElementById('adminMethodsList')
+  if (!box) return
+  const res = await apiAdmin('/api/admin/payment-methods', null, 'GET')
+  if (!res || res.status !== 'Real') { box.innerHTML = '<span class="muted small">' + esc((res && res.error) || 'Could not load methods.') + '</span>'; return }
+  window.__adminMethods = res.methods || []
+  if (!window.__adminMethods.length) { box.innerHTML = '<span class="muted small">No custom methods yet. Checkout uses its built-in gateway list until you add one here.</span>'; return }
+  box.innerHTML = '<div class="table-wrap"><table class="table"><thead><tr><th>Label</th><th>Number / ID</th><th>Network</th><th>Crypto</th><th>Enabled</th><th>Action</th></tr></thead><tbody>' +
+    window.__adminMethods.map(m => '<tr><td>' + esc(m.label) + '</td><td>' + esc(m.number) + '</td><td>' + esc(m.network || '-') + '</td><td>' + (m.crypto ? 'yes' : 'no') + '</td><td>' + (m.enabled !== false ? 'yes' : 'no') + '</td><td><div class="flex"><button class="btn btn-ghost btn-sm" data-pm-edit="' + esc(m.id) + '" type="button">Edit</button><button class="btn btn-ghost btn-sm" data-pm-toggle="' + esc(m.id) + '" type="button">' + (m.enabled !== false ? 'Disable' : 'Enable') + '</button><button class="btn btn-danger btn-sm" data-pm-del="' + esc(m.id) + '" type="button">Delete</button></div></td></tr>').join('') +
+    '</tbody></table></div>'
+}
+
+function fillMethodForm(m) {
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v }
+  const chk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v }
+  document.getElementById('pmFormTitle').textContent = 'Edit payment method'
+  set('pmId', m.id); set('pmLabel', m.label); set('pmNumber', m.number || ''); set('pmNetwork', m.network || '')
+  set('pmNote', m.note || ''); set('pmSort', m.sort || 1); chk('pmCrypto', m.crypto); chk('pmEnabled', m.enabled !== false)
+}
+
+function resetMethodForm() {
+  ['pmId', 'pmLabel', 'pmNumber', 'pmNetwork', 'pmNote'].forEach(id => { const el = document.getElementById(id); if (el) el.value = '' })
+  const s = document.getElementById('pmSort'); if (s) s.value = '1'
+  const c = document.getElementById('pmCrypto'); if (c) c.checked = false
+  const e2 = document.getElementById('pmEnabled'); if (e2) e2.checked = true
+  const t = document.getElementById('pmFormTitle'); if (t) t.textContent = 'Add a payment method'
+}
+
+function bindAdminMethods() {
+  loadAdminMethods()
+  const save = document.getElementById('pmSaveBtn')
+  if (save) save.addEventListener('click', async () => {
+    const val = id => ((document.getElementById(id) || {}).value || '').trim()
+    const body = {
+      id: val('pmId') || undefined, label: val('pmLabel'), number: val('pmNumber'), network: val('pmNetwork'),
+      note: ((document.getElementById('pmNote') || {}).value || '').trim(), sort: Number(val('pmSort')) || 1,
+      crypto: !!(document.getElementById('pmCrypto') || {}).checked,
+      enabled: !!(document.getElementById('pmEnabled') || {}).checked
+    }
+    const res = await apiAdmin('/api/admin/payment-methods', body)
+    aMsg('pmMsg', res && (res.error || ('Saved "' + ((res.method || {}).label || body.label) + '".')), res && res.status === 'Real')
+    if (res && res.status === 'Real') { resetMethodForm(); loadAdminMethods() }
+  })
+  const reset = document.getElementById('pmResetBtn'); if (reset) reset.addEventListener('click', resetMethodForm)
+  const box = document.getElementById('adminMethodsList')
+  if (box) box.addEventListener('click', async e => {
+    const eb = e.target.closest('[data-pm-edit]')
+    if (eb) { const m = (window.__adminMethods || []).find(x => x.id === eb.getAttribute('data-pm-edit')); if (m) fillMethodForm(m); return }
+    const tb = e.target.closest('[data-pm-toggle]')
+    if (tb) { const m = (window.__adminMethods || []).find(x => x.id === tb.getAttribute('data-pm-toggle')); if (m) { const res = await apiAdmin('/api/admin/payment-methods', { id: m.id, enabled: m.enabled === false }, 'POST'); toast((res && (res.error || (m.enabled === false ? 'Enabled' : 'Disabled'))) || 'Done', res && res.status === 'Real' ? 'success' : 'error'); loadAdminMethods() } return }
+    const db = e.target.closest('[data-pm-del]')
+    if (db && confirm('Delete this payment method?')) {
+      const res = await apiAdmin('/api/admin/payment-methods/' + encodeURIComponent(db.getAttribute('data-pm-del')), null, 'DELETE')
+      toast((res && (res.error || 'Method deleted')) || 'Done', res && res.status === 'Real' ? 'success' : 'error')
+      loadAdminMethods()
+    }
+  })
+}
+
+/* ----- moderators ----- */
+async function loadAdminModerators() {
+  const box = document.getElementById('adminModsList')
+  if (!box) return
+  const res = await apiAdmin('/api/admin/moderators', null, 'GET')
+  if (!res || res.status !== 'Real') { box.innerHTML = '<span class="muted small">' + esc((res && res.error) || 'Could not load moderators.') + '</span>'; return }
+  window.__adminMods = res.moderators || []
+  if (!window.__adminMods.length) { box.innerHTML = '<span class="muted small">No moderators yet.</span>'; return }
+  box.innerHTML = '<div class="table-wrap"><table class="table"><thead><tr><th>Name</th><th>Email</th><th>Permissions</th><th>Status</th><th>Last login</th><th>Action</th></tr></thead><tbody>' +
+    window.__adminMods.map(m => '<tr><td>' + esc(m.name) + '</td><td>' + esc(m.email) + '</td><td>' + esc((m.permissions || []).join(', ')) + '</td><td>' + (m.active !== false ? '<span class="label-pill label-good">ACTIVE</span>' : '<span class="label-pill label-veryhigh">DISABLED</span>') + '</td><td><span class="muted small">' + (m.lastLoginAt ? fmtDate(m.lastLoginAt) : 'never') + '</span></td><td><div class="flex"><button class="btn btn-ghost btn-sm" data-mod-toggle="' + esc(m.id) + '" type="button">' + (m.active !== false ? 'Disable' : 'Enable') + '</button><button class="btn btn-ghost btn-sm" data-mod-pass="' + esc(m.id) + '" type="button">Reset password</button><button class="btn btn-danger btn-sm" data-mod-del="' + esc(m.id) + '" type="button">Delete</button></div></td></tr>').join('') +
+    '</tbody></table></div>'
+}
+
+function bindAdminModerators() {
+  loadAdminModerators()
+  const create = document.getElementById('modCreateBtn')
+  if (create) create.addEventListener('click', async () => {
+    const val = id => ((document.getElementById(id) || {}).value || '').trim()
+    const body = { name: val('modName'), email: val('modEmail'), password: (document.getElementById('modPassword') || {}).value || '' }
+    const res = await apiAdmin('/api/admin/moderators', body)
+    aMsg('modMsg', res && (res.error || ('Created moderator ' + ((res.moderator || {}).email || body.email) + '. They can sign in from the Admin login with only Logs + Live Chat access.')), res && res.status === 'Real')
+    if (res && res.status === 'Real') { ['modName', 'modEmail', 'modPassword'].forEach(id => { const el = document.getElementById(id); if (el) el.value = '' }); loadAdminModerators() }
+  })
+  const box = document.getElementById('adminModsList')
+  if (box) box.addEventListener('click', async e => {
+    const tb = e.target.closest('[data-mod-toggle]')
+    if (tb) { const m = (window.__adminMods || []).find(x => x.id === tb.getAttribute('data-mod-toggle')); if (m) { const res = await apiAdmin('/api/admin/moderators/' + encodeURIComponent(m.id), { active: m.active === false }, 'PATCH'); toast((res && (res.error || (m.active === false ? 'Enabled' : 'Disabled'))) || 'Done', res && res.status === 'Real' ? 'success' : 'error'); loadAdminModerators() } return }
+    const pb = e.target.closest('[data-mod-pass]')
+    if (pb) { const pw = prompt('New password for this moderator (min 8 characters):'); if (!pw) return; const res = await apiAdmin('/api/admin/moderators/' + encodeURIComponent(pb.getAttribute('data-mod-pass')), { password: pw }, 'PATCH'); toast((res && (res.error || 'Password updated')) || 'Done', res && res.status === 'Real' ? 'success' : 'error'); return }
+    const db = e.target.closest('[data-mod-del]')
+    if (db && confirm('Delete this moderator account?')) { const res = await apiAdmin('/api/admin/moderators/' + encodeURIComponent(db.getAttribute('data-mod-del')), null, 'DELETE'); toast((res && (res.error || 'Moderator deleted')) || 'Done', res && res.status === 'Real' ? 'success' : 'error'); loadAdminModerators() }
+  })
+}
+
+/* ----- logs / audit ----- */
+async function loadAdminLogs() {
+  const box = document.getElementById('adminLogs')
+  if (!box) return
+  const res = await apiAdmin('/api/admin/logs?type=all&limit=200', null, 'GET')
+  if (!res || res.status !== 'Real') { box.innerHTML = '<span class="muted small">' + esc((res && res.error) || 'Could not load logs.') + '</span>'; return }
+  const cEl = document.getElementById('logConcurrency')
+  if (cEl) cEl.textContent = 'In-flight background jobs: ' + (res.inFlight || 0) + ' / ' + (res.concurrencyLimit || '-') + '.'
+  const sys = res.system || []
+  box.innerHTML = sys.length ? '<div class="table-wrap"><table class="table"><thead><tr><th>Time</th><th>Level</th><th>Source</th><th>Message</th></tr></thead><tbody>' +
+    sys.map(l => '<tr><td><span class="muted small">' + fmtDate(l.at) + '</span></td><td>' + levelPill(l.level) + '</td><td>' + esc(l.source) + '</td><td>' + esc(l.message) + '</td></tr>').join('') +
+    '</tbody></table></div>' : '<span class="muted small">No system logs yet.</span>'
+}
+
+function bindAdminLogs() {
+  loadAdminLogs()
+  const r = document.getElementById('logsRefreshBtn'); if (r) r.addEventListener('click', loadAdminLogs)
+  const c = document.getElementById('logsClearBtn')
+  if (c) c.addEventListener('click', async () => { if (!confirm('Clear all system logs?')) return; const res = await apiAdmin('/api/admin/logs/clear', { type: 'system' }); toast((res && (res.error || 'System logs cleared')) || 'Done', res && res.status === 'Real' ? 'success' : 'error'); loadAdminLogs() })
+  if (window.__logsTimer) clearInterval(window.__logsTimer)
+  window.__logsTimer = setInterval(() => { if (pathFromLocation() === '/admin' && state.adminTab === 'logs') loadAdminLogs() }, 15000)
+}
+
+async function loadAdminAudit() {
+  const box = document.getElementById('adminAudit')
+  if (!box) return
+  const res = await apiAdmin('/api/admin/logs?type=audit&limit=200', null, 'GET')
+  if (!res || res.status !== 'Real') { box.innerHTML = '<span class="muted small">' + esc((res && res.error) || 'Could not load audit logs.') + '</span>'; return }
+  const list = res.audit || []
+  box.innerHTML = list.length ? '<div class="table-wrap"><table class="table"><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>IP</th></tr></thead><tbody>' +
+    list.map(l => '<tr><td><span class="muted small">' + fmtDate(l.at) + '</span></td><td>' + esc(l.actor) + '</td><td>' + esc(l.action) + '</td><td>' + esc(l.target || '-') + '</td><td><span class="muted small">' + esc(l.ip || '-') + '</span></td></tr>').join('') +
+    '</tbody></table></div>' : '<span class="muted small">No audit events yet.</span>'
+}
+
+function bindAdminAudit() {
+  loadAdminAudit()
+  const r = document.getElementById('auditRefreshBtn'); if (r) r.addEventListener('click', loadAdminAudit)
+  const c = document.getElementById('auditClearBtn')
+  if (c) c.addEventListener('click', async () => { if (!confirm('Clear all audit logs?')) return; const res = await apiAdmin('/api/admin/logs/clear', { type: 'audit' }); toast((res && (res.error || 'Audit logs cleared')) || 'Done', res && res.status === 'Real' ? 'success' : 'error'); loadAdminAudit() })
+}
+
+/* ----- maintenance / site settings ----- */
+async function loadAdminMaintenance() {
+  const res = await apiAdmin('/api/admin/settings', null, 'GET')
+  if (!res || res.status !== 'Real') { aMsg('mtMsg', (res && res.error) || 'Could not load settings.', false); return }
+  const s = res.settings || {}
+  const m = document.getElementById('mtMaintenance'); if (m) m.checked = !!s.maintenance
+  const r = document.getElementById('mtRegistrations'); if (r) r.checked = s.allowRegistration !== false
+  const c = document.getElementById('mtConcurrency'); if (c) c.value = s.concurrencyLimit || 8
+  const who = document.getElementById('mtUpdated')
+  if (who) who.textContent = s.updatedAt ? ('Last changed ' + fmtDate(s.updatedAt) + (s.updatedBy ? ' by ' + s.updatedBy : '')) : ''
+}
+
+function bindAdminMaintenance() {
+  loadAdminMaintenance()
+  const save = document.getElementById('mtSaveBtn')
+  if (save) save.addEventListener('click', async () => {
+    const body = {
+      maintenance: !!(document.getElementById('mtMaintenance') || {}).checked,
+      allowRegistration: !!(document.getElementById('mtRegistrations') || {}).checked,
+      concurrencyLimit: Number((document.getElementById('mtConcurrency') || {}).value) || 8
+    }
+    const res = await apiAdmin('/api/admin/settings', body)
+    aMsg('mtMsg', res && (res.error || ('Settings saved. Maintenance is ' + (body.maintenance ? 'ON' : 'OFF') + '.')), res && res.status === 'Real')
+    if (res && res.status === 'Real') { toast('Settings saved'); loadAdminMaintenance() }
+  })
+}
+
+/* ----- users (create) + live chat (per-user reply + broadcast) ----- */
+function bindAdminUsers() {
+  const btn = document.getElementById('newUserBtn')
+  if (!btn) return
+  btn.addEventListener('click', async () => {
+    const val = id => ((document.getElementById(id) || {}).value || '').trim()
+    const body = { name: val('newUserName'), email: val('newUserEmail'), password: (document.getElementById('newUserPass') || {}).value || '' }
+    if (!body.name || !body.email || !body.password) { aMsg('newUserMsg', 'Name, email and password are all required.', false); return }
+    btn.disabled = true
+    const res = await apiAdmin('/api/admin/users', body)
+    btn.disabled = false
+    aMsg('newUserMsg', res && (res.error || ('Created user ' + ((res.user || {}).email || body.email) + '. They can now log in.')) , res && res.status === 'Real')
+    if (res && res.status === 'Real') { ['newUserName', 'newUserEmail', 'newUserPass'].forEach(id => { const el = document.getElementById(id); if (el) el.value = '' }) }
+  })
+}
+
+async function loadAdminChats() {
+  const box = document.getElementById('adminChats')
+  if (!box) return
+  const res = await apiAdmin('/api/admin/chats', null, 'GET')
+  if (!res || res.status !== 'Real') { box.innerHTML = '<span class="muted small">' + esc((res && res.error) || 'Could not load conversations.') + '</span>'; return }
+  const chats = res.chats || []
+  window.__adminChats = chats
+  if (state.adminChatId) {
+    const c = chats.find(x => x.email === state.adminChatId)
+    if (c) {
+      const msgs = (c.messages || []).map(m =>
+        '<div class="msg msg-' + (m.from === 'user' ? 'user' : 'admin') + '">' + esc(m.text) + '<span class="msg-time">' + fmtTime(m.at || m.time) + '</span></div>').join('')
+      box.innerHTML = '<button class="btn btn-ghost btn-sm" data-back-thread type="button">Back to threads</button>' +
+        '<div class="chat-thread mt-16"><h4>' + esc(c.name || c.email) + '</h4><div class="ct-meta">' + esc(c.email) + '</div>' +
+        '<div class="mt-16" style="max-height:320px;overflow-y:auto">' + (msgs || '<span class="muted small">No messages</span>') + '</div>' +
+        '<div class="input-row mt-16"><input type="text" id="adminReplyInput" placeholder="Reply as ' + esc(adminRole()) + '..."><button class="btn btn-primary" id="adminReplyBtn" type="button">Send</button></div></div>'
+      const rb = document.getElementById('adminReplyBtn')
+      if (rb) rb.addEventListener('click', async () => {
+        const input = document.getElementById('adminReplyInput')
+        const text = input ? input.value.trim() : ''
+        if (!text) return
+        rb.disabled = true
+        const sres = await apiAdmin('/api/admin/chats/reply', { email: c.email, text })
+        rb.disabled = false
+        if (sres && sres.status === 'Real') { toast('Reply sent'); if (input) input.value = ''; loadAdminChats() }
+        else toast((sres && sres.error) || 'Could not send reply', 'error')
+      })
+      return
+    }
+    state.adminChatId = null
+  }
+  box.innerHTML = chats.length ? '<div class="chat-list">' + chats.map(c => {
+    const msgs = c.messages || []
+    const last = msgs[msgs.length - 1] || {}
+    return '<div class="chat-thread" data-open-thread="' + esc(c.email) + '" style="cursor:pointer">' +
+      '<h4>' + esc(c.name || c.email) + (c.admin_unread ? ' <span class="label-pill label-good">' + c.admin_unread + ' new</span>' : '') + '</h4>' +
+      '<div class="ct-meta">' + esc(c.email) + ' - ' + (c.updated_at ? fmtTime(c.updated_at) : '') + '</div>' +
+      '<div class="muted small">' + esc(last.text || '') + '</div></div>'
+  }).join('') + '</div>' : '<span class="muted small">No conversations yet.</span>'
+}
+
+function bindAdminChats() {
+  loadAdminChats()
+  const bc = document.getElementById('broadcastBtn')
+  if (bc) bc.addEventListener('click', async () => {
+    const el = document.getElementById('broadcastText')
+    const text = el ? el.value.trim() : ''
+    if (!text) { aMsg('broadcastMsg', 'Enter a message to broadcast.', false); return }
+    if (!confirm('Send this message to every user in live chat?')) return
+    bc.disabled = true
+    const res = await apiAdmin('/api/admin/chats/broadcast', { text })
+    bc.disabled = false
+    aMsg('broadcastMsg', res && (res.error || ('Broadcast sent to ' + (res.sent || 0) + ' user(s).')), res && res.status === 'Real')
+    if (res && res.status === 'Real' && el) el.value = ''
+  })
+  if (window.__chatTimer) clearInterval(window.__chatTimer)
+  window.__chatTimer = setInterval(() => {
+    if (pathFromLocation() === '/admin' && state.adminTab === 'chats' && !document.getElementById('adminReplyInput')) loadAdminChats()
+  }, 12000)
 }
 
 /* ---------- admin password recovery via OTP ---------- */
@@ -2215,7 +2834,7 @@ function googleContinue() {
     setSession({ email: user.email })
     closeModal()
     toast('Signed in with Google - ' + user.email)
-    location.hash = '#/dashboard'
+    go('/dashboard')
   }, 1200)
 }
 
@@ -2410,7 +3029,7 @@ async function otpRegisterComplete() {
   }
   closeModal()
   toast('Email verified - welcome, ' + r.user.name.split(' ')[0])
-  location.hash = '#/dashboard'
+  go('/dashboard')
 }
 
 function fpStepNewPassword() {
@@ -2445,7 +3064,7 @@ function fpStepNewPassword() {
     setSession({ email: otpState.email })
     toast('Password reset successfully - you are logged in')
     closeModal()
-    location.hash = '#/dashboard'
+    go('/dashboard')
   }
   const btn = box.querySelector('#npBtn')
   if (btn) btn.addEventListener('click', submit)
@@ -2457,7 +3076,7 @@ function fpStepNewPassword() {
 
 function openPhoneVerify() {
   const u = currentUser()
-  if (!u) { toast('Please login first', 'error'); location.hash = '#/auth'; return }
+  if (!u) { toast('Please login first', 'error'); go('/auth'); return }
   otpState = { mode: 'phone', purpose: 'verify_phone', channel: null, contact: null, sent: null, sending: false, targetUser: u }
   const box = otpModal('Verify your mobile number', 'Add a mobile number and prove you own it. Once verified it can be used to reset your password via SMS or WhatsApp.')
   otpState.box = box
@@ -2500,7 +3119,7 @@ function otpVerifiedSave() {
   }
   toast('Mobile number verified - ' + maskPhone(otpState.contact))
   closeModal()
-  if (location.hash === '#/dashboard') navigate()
+  if (pathFromLocation() === '/dashboard') navigate()
 }
 
 /* ============================================================== live chat */
@@ -2592,7 +3211,7 @@ function bindView(path, root) {
     adminLoginBtn.addEventListener('click', async () => {
       const email = (document.getElementById('adminEmail') || {}).value || ''
       const pass = (document.getElementById('adminPass') || {}).value || ''
-      if (!isAdmin(email)) { state.adminError = 'Not an admin account'; navigate(); return }
+      if (!email) { state.adminError = 'Enter your admin email'; navigate(); return }
       adminLoginBtn.disabled = true
       adminLoginBtn.innerHTML = '<span class="spinner"></span> Verifying...'
       let res = null
@@ -2607,14 +3226,16 @@ function bindView(path, root) {
       const users = store.users()
       let stored = users.find(x => x.email === email.toLowerCase().trim())
       if (!stored) {
-        stored = { name: 'Admin', email: email.toLowerCase().trim(), provider: 'admin', createdAt: new Date().toISOString(), premium: { status: 'Active', planName: 'Owner' }, blocked: false, deleted: false }
+        stored = { name: res.role === 'moderator' ? 'Moderator' : 'Admin', email: email.toLowerCase().trim(), provider: 'admin', createdAt: new Date().toISOString(), premium: { status: res.role === 'moderator' ? '' : 'Active', planName: res.role === 'moderator' ? 'Moderator' : 'Owner' }, blocked: false, deleted: false }
         users.push(stored)
         store.saveUsers(users)
       }
-      setAdminToken(stored.email, res.token, res.expiresIn)
+      setAdminToken(stored.email, res.token, res.expiresIn, res.role, res.permissions)
       setSession({ email: stored.email })
       state.adminError = ''
-      toast('Admin login successful')
+      state.adminTab = res.role === 'moderator' ? 'logs' : 'users'
+      state.adminChatId = null
+      toast(res.role === 'moderator' ? 'Moderator login successful' : 'Admin login successful')
       navigate()
     })
   }
@@ -2634,10 +3255,10 @@ function bindView(path, root) {
         openRegisterOtpFlow(name, email, pass)
         return
       }
-      if (isAdmin(String(email).trim())) { toast('Admin account - opening the Admin login'); location.hash = '#/admin'; return }
+      if (isAdmin(String(email).trim())) { toast('Admin account - opening the Admin login'); go('/admin'); return }
       const r = await loginUser(email, pass)
       if (alertEl) alertEl.innerHTML = r.error ? '<div class="alert alert-error">' + esc(r.error) + '</div>' : ''
-      if (r.ok) { toast('Welcome, ' + r.user.name.split(' ')[0]); location.hash = '#/dashboard' }
+      if (r.ok) { toast('Welcome, ' + r.user.name.split(' ')[0]); go('/dashboard') }
     })
   }
   root.querySelectorAll('[data-switch-auth]').forEach(a => {
@@ -2655,6 +3276,15 @@ function bindView(path, root) {
     if (forgotLink) forgotLink.addEventListener('click', e => { e.preventDefault(); openAdminForgot() })
     if (state.adminTab === 'account') bindAdminAccount()
     if (state.adminTab === 'dev') devBoot()
+    if (state.adminTab === 'users') bindAdminUsers()
+    if (state.adminTab === 'chats') bindAdminChats()
+    if (state.adminTab === 'payments') bindAdminProofs()
+    if (state.adminTab === 'plans') bindAdminPlans()
+    if (state.adminTab === 'methods') bindAdminMethods()
+    if (state.adminTab === 'moderators') bindAdminModerators()
+    if (state.adminTab === 'logs') bindAdminLogs()
+    if (state.adminTab === 'audit') bindAdminAudit()
+    if (state.adminTab === 'maintenance') bindAdminMaintenance()
   }
 }
 
@@ -2691,7 +3321,7 @@ function showDashTab(tab) {
   }
   panel.innerHTML = html
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.getAttribute('data-tab') === tab))
-  bindView((location.hash || '#/').replace(/^#/, ''), document.getElementById('mainView'))
+  bindView(pathFromLocation(), document.getElementById('mainView'))
 }
 
 /* ============================================================== global events */
@@ -2729,9 +3359,9 @@ function bindGlobal() {
     const cpPay = e.target.closest('[data-copy-pay]')
     if (cpPay) copyPaymentValue(cpPay.getAttribute('data-copy-pay'), cpPay)
     const goAdmin = e.target.closest('[data-goto-admin]')
-    if (goAdmin) { state.adminTab = 'users'; state.adminChatId = null; location.hash = '#/admin'; return }
+    if (goAdmin) { state.adminTab = 'users'; state.adminChatId = null; go('/admin'); return }
     const goAdminDev = e.target.closest('[data-goto-admin-dev]')
-    if (goAdminDev) { state.adminTab = 'dev'; state.adminChatId = null; location.hash = '#/admin'; return }
+    if (goAdminDev) { state.adminTab = 'dev'; state.adminChatId = null; go('/admin'); return }
     const devView = e.target.closest('[data-devview]')
     if (devView) { devViewFile(devView.getAttribute('data-devview')); return }
     const ca = e.target.closest('[data-copy-all]')
@@ -2789,9 +3419,6 @@ function bindGlobal() {
     const thread = e.target.closest('[data-open-thread]')
     if (thread) {
       state.adminChatId = thread.getAttribute('data-open-thread')
-      const chats = store.chats()
-      const c = chats.find(x => x.id === state.adminChatId)
-      if (c) { c.adminUnread = 0; store.saveChats(chats) }
       navigate()
     }
     const backThread = e.target.closest('[data-back-thread]')
@@ -2856,6 +3483,15 @@ function bindGlobal() {
     document.querySelectorAll('.chat-quick button').forEach(b => {
       b.addEventListener('click', () => chatSend(b.getAttribute('data-q')))
     })
+    window.setInterval(async () => {
+      if (widget.hidden || !cloudOn()) return
+      try { await cloudPull() } catch (e) {}
+      const chats = store.chats()
+      const chat = chats.find(c => c.email === identityForChat().email)
+      if (chat && chat.userUnread) { chat.userUnread = 0; store.saveChats(chats) }
+      renderChat()
+      updateChatBadge()
+    }, 10000)
   }
 
   const fp = document.getElementById('footerPayments')
@@ -2863,6 +3499,8 @@ function bindGlobal() {
 
   window.setInterval(updateChatBadge, 3000)
   window.addEventListener('hashchange', navigate)
+  window.addEventListener('popstate', navigate)
+  document.addEventListener('click', onInternalLinkClick)
 }
 
 /* ============================================================== boot */

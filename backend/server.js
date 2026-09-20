@@ -112,7 +112,46 @@ const authLimit = rateLimit('auth', 20, 10 * 60 * 1000)
 const cryptoLimit = rateLimit('crypto', 30, 10 * 60 * 1000)
 
 app.use('/api', generalLimit)
-app.use(express.json({ limit: '100kb' }))
+app.use(express.json({ limit: '2mb' }))
+
+// Maintenance mode + concurrency guard. Admin/health/site-config stay reachable
+// so the owner can always turn maintenance back off. Heavy AI/SEO jobs are
+// rejected with 503 when the configured in-flight limit is reached.
+const HEAVY_API_PATHS = ['/generate', '/serp', '/serp/batch', '/pagespeed', '/audit', '/ai-plan', '/gemini', '/chat']
+app.use('/api', async (req, res, next) => {
+  try {
+    const p = req.path || ''
+    if (p.indexOf('/admin') === 0 || p === '/health' || p === '/site-config') return next()
+    const settings = await getSiteSettings()
+    const isAdmin = !!verifyAdminToken(req.headers['x-admin-token'])
+    if (settings.maintenance && !isAdmin) {
+      return res.status(503).json({
+        status: 'Error', maintenance: true,
+        error: 'The service is temporarily under maintenance. Please try again shortly.',
+        compliance
+      })
+    }
+    if (HEAVY_API_PATHS.indexOf(p) >= 0) {
+      if (INFLIGHT >= settings.concurrencyLimit) {
+        sysLog('warn', 'concurrency', 'Rejected ' + p + ' (in-flight ' + INFLIGHT + '/' + settings.concurrencyLimit + ')')
+        return res.status(503).json({ status: 'Error', busy: true, error: 'Server is busy right now. Please retry in a moment.', compliance })
+      }
+      acquireSlot()
+      const startedAt = Date.now()
+      let released = false
+      const release = () => { if (released) return; released = true; releaseSlot() }
+      res.on('finish', () => {
+        release()
+        const code = res.statusCode
+        const source = p.replace(/^\//, '').replace(/\//g, '-') || 'api'
+        sysLog(code >= 500 ? 'error' : (code >= 400 ? 'warn' : 'success'), source,
+          'Job finished with HTTP ' + code + ' in ' + (Date.now() - startedAt) + 'ms', { path: p, status: code })
+      })
+      res.on('close', release)
+    }
+  } catch (e) { /* never block traffic on a settings read failure */ }
+  next()
+})
 
 const PAGESPEED_API_KEY = process.env.PAGESPEED_API_KEY || ''
 const SERPAPI_API_KEY = process.env.SERPAPI_API_KEY || ''
@@ -137,8 +176,13 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ba, bb)
 }
 
-function makeAdminToken(email) {
-  const payload = Buffer.from(JSON.stringify({ email, exp: Date.now() + ADMIN_TOKEN_TTL_MS })).toString('base64url')
+function makeAdminToken(email, role, permissions) {
+  const payload = Buffer.from(JSON.stringify({
+    email,
+    role: role === 'moderator' ? 'moderator' : 'admin',
+    permissions: permissions || null,
+    exp: Date.now() + ADMIN_TOKEN_TTL_MS
+  })).toString('base64url')
   const sig = crypto.createHmac('sha256', ADMIN_SECRET).update(payload).digest('base64url')
   return payload + '.' + sig
 }
@@ -151,16 +195,40 @@ function verifyAdminToken(token) {
   try {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString())
     if (!data || !data.exp || Date.now() > data.exp) return null
-    if (!ADMIN_EMAILS.includes(String(data.email || '').toLowerCase())) return null
+    const email = String(data.email || '').toLowerCase()
+    const role = data.role === 'moderator' ? 'moderator' : 'admin'
+    if (role === 'admin' && !ADMIN_EMAILS.includes(email)) return null
+    data.email = email
+    data.role = role
     return data
   } catch (e) { return null }
 }
 
-function requireAdmin(req, res, next) {
+const MODERATOR_DEFAULT_PERMISSIONS = ['logs', 'chats']
+
+async function requireAdmin(req, res, next) {
   const data = verifyAdminToken(req.headers['x-admin-token'])
-  if (!data) return res.status(401).json({ status: 'Error', error: 'Admin login required' })
+  if (!data) return res.status(401).json({ status: 'Error', error: 'Admin login required', compliance })
+  if (data.role === 'moderator') {
+    let mods = []
+    try { mods = (await kvGet('moderators', [])) || [] } catch (e) { mods = [] }
+    const m = mods.find(x => String(x.email || '').toLowerCase() === data.email && x.active !== false)
+    if (!m) return res.status(401).json({ status: 'Error', error: 'Moderator access revoked. Please sign in again.', compliance })
+    data.permissions = Array.isArray(m.permissions) && m.permissions.length ? m.permissions : MODERATOR_DEFAULT_PERMISSIONS
+  }
   req.adminEmail = data.email
+  req.adminRole = data.role
+  req.adminPermissions = data.role === 'moderator' ? data.permissions : ['all']
   next()
+}
+
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!roles.includes(req.adminRole)) {
+      return res.status(403).json({ status: 'Error', error: 'Your role does not have permission for this action.', compliance })
+    }
+    next()
+  }
 }
 
 // ---------------------------------------------------------------- admin account store
@@ -230,6 +298,246 @@ async function saveAdminAccount(email, patch) {
   all[email] = Object.assign({}, all[email] || {}, patch, { updatedAt: new Date().toISOString() })
   await supaWriteSetting(ADMIN_SETTINGS_KEY, all)
   return all[email]
+}
+
+// ---------------------------------------------------------------- admin KV store
+// Small JSON key/value store for admin-managed data (plans, payment methods,
+// moderators, logs, site settings). Persisted in Supabase app_settings via the
+// service-role key when configured; falls back to an in-memory store locally.
+const MEM_KV = Object.create(null)
+
+function kvReady() { return supabaseReady() }
+
+async function kvGet(key, fallback) {
+  if (kvReady()) {
+    try {
+      const v = await supaReadSetting(key)
+      if (v !== null && v !== undefined) return v
+    } catch (e) { /* fall through to memory */ }
+  }
+  return Object.prototype.hasOwnProperty.call(MEM_KV, key) ? MEM_KV[key] : fallback
+}
+
+async function kvSet(key, value) {
+  MEM_KV[key] = value
+  if (kvReady()) {
+    try { await supaWriteSetting(key, value) } catch (e) { /* keep memory copy */ }
+  }
+  return value
+}
+
+function newId(prefix) {
+  return (prefix || 'id') + '_' + Date.now().toString(36) + crypto.randomBytes(4).toString('hex')
+}
+
+// ---- site settings (maintenance / registrations / concurrency) ----
+const SITE_SETTINGS_KEY = 'site_settings'
+const DEFAULT_SITE_SETTINGS = {
+  maintenance: false,
+  allowRegistration: true,
+  concurrencyLimit: 8,
+  updatedAt: null,
+  updatedBy: null
+}
+
+async function getSiteSettings() {
+  const v = await kvGet(SITE_SETTINGS_KEY, null)
+  return Object.assign({}, DEFAULT_SITE_SETTINGS, (v && typeof v === 'object' && !Array.isArray(v)) ? v : {})
+}
+
+async function saveSiteSettings(patch, actor) {
+  const cur = await getSiteSettings()
+  const next = Object.assign({}, cur, patch, { updatedAt: new Date().toISOString(), updatedBy: actor || cur.updatedBy || null })
+  if (typeof next.concurrencyLimit !== 'number' || !isFinite(next.concurrencyLimit)) next.concurrencyLimit = DEFAULT_SITE_SETTINGS.concurrencyLimit
+  next.concurrencyLimit = Math.max(1, Math.min(64, Math.round(next.concurrencyLimit)))
+  next.maintenance = !!next.maintenance
+  next.allowRegistration = !!next.allowRegistration
+  await kvSet(SITE_SETTINGS_KEY, next)
+  return next
+}
+
+// ---- system logs + audit logs ----
+const SYSTEM_LOGS_KEY = 'system_logs'
+const AUDIT_LOGS_KEY = 'audit_logs'
+const SYSTEM_LOGS_CAP = 800
+const AUDIT_LOGS_CAP = 500
+
+async function appendLog(key, cap, entry) {
+  try {
+    const list = (await kvGet(key, [])) || []
+    const arr = Array.isArray(list) ? list : []
+    arr.unshift(Object.assign({ id: newId('log'), at: new Date().toISOString() }, entry))
+    await kvSet(key, arr.slice(0, cap))
+  } catch (e) { /* logging must never break a request */ }
+}
+
+function sysLog(level, source, message, meta) {
+  const entry = { level: level || 'info', source: source || 'app', message: String(message || '').slice(0, 500), meta: meta || null }
+  appendLog(SYSTEM_LOGS_KEY, SYSTEM_LOGS_CAP, entry)
+  return entry
+}
+
+function auditLog(actor, action, target, meta, ip) {
+  const entry = { actor: actor || 'system', action: action || 'action', target: target || null, meta: meta || null, ip: ip || null }
+  appendLog(AUDIT_LOGS_KEY, AUDIT_LOGS_CAP, entry)
+  return entry
+}
+
+async function getLogs(key, limit) {
+  const list = (await kvGet(key, [])) || []
+  const arr = Array.isArray(list) ? list : []
+  const n = Math.max(1, Math.min(500, Number(limit) || 200))
+  return arr.slice(0, n)
+}
+
+async function clearLogs(key) {
+  await kvSet(key, [])
+}
+
+// ---- plans ----
+const PLANS_KEY = 'plans'
+async function getPlans() {
+  const v = await kvGet(PLANS_KEY, null)
+  return Array.isArray(v) ? v : []
+}
+async function savePlan(plan, actor) {
+  if (!plan || !plan.name) throw new Error('Plan name is required')
+  const plans = await getPlans()
+  const id = plan.id || newId('plan')
+  const idx = plans.findIndex(p => p.id === id)
+  const clean = {
+    id,
+    name: String(plan.name).slice(0, 60),
+    price: Number(plan.price) || 0,
+    currency: String(plan.currency || 'BDT').slice(0, 8),
+    agents: Number(plan.agents) || 1,
+    daily: Number(plan.daily) || 10,
+    monthly: Number(plan.monthly) || 100,
+    features: Array.isArray(plan.features) ? plan.features.slice(0, 20).map(f => String(f).slice(0, 120)) : [],
+    badge: plan.badge ? String(plan.badge).slice(0, 24) : '',
+    active: plan.active !== false,
+    sort: Number.isFinite(Number(plan.sort)) ? Number(plan.sort) : (plans.length + 1),
+    updatedAt: new Date().toISOString()
+  }
+  if (idx >= 0) plans[idx] = Object.assign({}, plans[idx], clean)
+  else plans.push(Object.assign({ createdAt: new Date().toISOString() }, clean))
+  plans.sort((a, b) => (Number(a.sort) || 0) - (Number(b.sort) || 0))
+  await kvSet(PLANS_KEY, plans)
+  return clean
+}
+async function deletePlan(id, actor) {
+  const plans = await getPlans()
+  const next = plans.filter(p => p.id !== id)
+  await kvSet(PLANS_KEY, next)
+  return plans.length !== next.length
+}
+
+// ---- payment methods ----
+const METHODS_KEY = 'payment_methods'
+async function getPaymentMethods() {
+  const v = await kvGet(METHODS_KEY, null)
+  return Array.isArray(v) ? v : []
+}
+async function savePaymentMethod(m, actor) {
+  if (!m || !m.label) throw new Error('Payment method label is required')
+  const list = await getPaymentMethods()
+  const id = m.id || newId('pm')
+  const idx = list.findIndex(p => p.id === id)
+  const clean = {
+    id,
+    label: String(m.label).slice(0, 60),
+    number: String(m.number || '').slice(0, 120),
+    network: String(m.network || '').slice(0, 60),
+    note: String(m.note || '').slice(0, 240),
+    crypto: !!m.crypto,
+    enabled: m.enabled !== false,
+    sort: Number.isFinite(Number(m.sort)) ? Number(m.sort) : (list.length + 1),
+    updatedAt: new Date().toISOString()
+  }
+  if (idx >= 0) list[idx] = Object.assign({}, list[idx], clean)
+  else list.push(Object.assign({ createdAt: new Date().toISOString() }, clean))
+  list.sort((a, b) => (Number(a.sort) || 0) - (Number(b.sort) || 0))
+  await kvSet(METHODS_KEY, list)
+  return clean
+}
+async function deletePaymentMethod(id, actor) {
+  const list = await getPaymentMethods()
+  const next = list.filter(p => p.id !== id)
+  await kvSet(METHODS_KEY, next)
+  return list.length !== next.length
+}
+
+// ---- moderators ----
+const MODERATORS_KEY = 'moderators'
+async function getModerators() {
+  const v = await kvGet(MODERATORS_KEY, null)
+  return Array.isArray(v) ? v : []
+}
+function publicModerator(m) {
+  return {
+    id: m.id, name: m.name, email: m.email, active: m.active !== false,
+    permissions: Array.isArray(m.permissions) && m.permissions.length ? m.permissions : MODERATOR_DEFAULT_PERMISSIONS,
+    createdAt: m.createdAt || null, lastLoginAt: m.lastLoginAt || null, createdBy: m.createdBy || null
+  }
+}
+async function createModerator(input, actor) {
+  const name = String(input.name || '').trim().slice(0, 80)
+  const email = String(input.email || '').trim().toLowerCase()
+  const password = String(input.password || '')
+  if (!name) throw new Error('Moderator name is required')
+  if (!EMAIL_RE.test(email)) throw new Error('Enter a valid moderator email address')
+  if (password.length < 8) throw new Error('Moderator password must be at least 8 characters')
+  if (ADMIN_EMAILS.includes(email)) throw new Error('This email is already an owner/admin account')
+  const mods = await getModerators()
+  if (mods.some(m => String(m.email || '').toLowerCase() === email)) throw new Error('A moderator with this email already exists')
+  const mod = {
+    id: newId('mod'),
+    name, email,
+    hash: hashAdminPassword(password),
+    active: true,
+    permissions: MODERATOR_DEFAULT_PERMISSIONS.slice(),
+    createdAt: new Date().toISOString(),
+    createdBy: actor || null,
+    lastLoginAt: null
+  }
+  mods.push(mod)
+  await kvSet(MODERATORS_KEY, mods)
+  return publicModerator(mod)
+}
+async function updateModerator(id, patch, actor) {
+  const mods = await getModerators()
+  const mod = mods.find(m => m.id === id)
+  if (!mod) throw new Error('Moderator not found')
+  if (patch.name !== undefined) mod.name = String(patch.name).slice(0, 80)
+  if (patch.active !== undefined) mod.active = !!patch.active
+  if (patch.password) {
+    if (String(patch.password).length < 8) throw new Error('Moderator password must be at least 8 characters')
+    mod.hash = hashAdminPassword(String(patch.password))
+  }
+  if (Array.isArray(patch.permissions)) {
+    mod.permissions = patch.permissions.filter(p => MODERATOR_DEFAULT_PERMISSIONS.includes(p))
+    if (!mod.permissions.length) mod.permissions = MODERATOR_DEFAULT_PERMISSIONS.slice()
+  }
+  mod.updatedAt = new Date().toISOString()
+  mod.updatedBy = actor || null
+  await kvSet(MODERATORS_KEY, mods)
+  return publicModerator(mod)
+}
+async function deleteModerator(id, actor) {
+  const mods = await getModerators()
+  const next = mods.filter(m => m.id !== id)
+  await kvSet(MODERATORS_KEY, next)
+  return mods.length !== next.length
+}
+
+// ---- concurrency guard ----
+let INFLIGHT = 0
+function acquireSlot() {
+  INFLIGHT++
+  return INFLIGHT
+}
+function releaseSlot() {
+  if (INFLIGHT > 0) INFLIGHT--
 }
 
 function maskContact(channel, contact) {
@@ -709,6 +1017,9 @@ const CHAT_INTENT_PATTERNS = {
   ranking: [/\b(rank|ranking|ranked|traffic|backlinks?|optimize|optimization|google|algorithm|snippet|higher\s*ranking|seo)\b/i]
 }
 
+const SUPPORT_WHATSAPP = process.env.SUPPORT_WHATSAPP || '01883822816'
+const SUPPORT_WHATSAPP_WA = '+880' + SUPPORT_WHATSAPP.replace(/^0/, '')
+
 function detectChatIntent(message) {
   const q = String(message || '')
   for (const [name, pats] of Object.entries(CHAT_INTENT_PATTERNS)) {
@@ -726,23 +1037,23 @@ function buildChatReply(intent, query) {
     case 'thanks':
       return "You're welcome! If you need anything else - pricing, tools or support - just ask."
     case 'bye':
-      return 'Thanks for visiting SEOPro AI! If you need us later, reach us on WhatsApp 01886822816 anytime.'
+      return 'Thanks for visiting SEOPro AI! If you need us later, message our human support on WhatsApp ' + SUPPORT_WHATSAPP + ' anytime.'
     case 'pricing':
       return 'Our pricing is simple and real:\n\n' +
         PLANS.map(p => `${p.name} — $${p.price}/mo: ${p.daily} credits/day, ${p.agents} agents, ${p.tools} tools`).join('\n') +
-        '\n\nWe accept bKash, Nagad, Rocket, Bank Asia, Binance Pay, USDT (BEP20/TRC20), Solana, ETH, Arbitrum, Card and PayPal. Crypto payments auto-verify on-chain in ~2 seconds; mobile/bank payments are approved by our admin. Open #/pricing to buy.'
+        '\n\nWe accept bKash, Nagad, Rocket, Bank Asia, Binance Pay, USDT (BEP20/TRC20), Solana, ETH, Arbitrum, Card and PayPal. Crypto payments auto-verify on-chain in ~2 seconds; mobile/bank payments are approved by our admin. Open /pricing to buy.'
     case 'payment':
-      return 'We accept 12 payment methods:\n\nMobile/Bank: bKash (01886822816), Nagad (01613822816), Rocket (Coming Soon), Bank Asia (account info after checkout), Card & PayPal.\nCrypto: Binance Pay, USDT (BEP20/TRC20), Solana, ETH, Arbitrum.\n\nCrypto payments are verified automatically on-chain in ~2 seconds via BscScan. bKash/Nagad/bank payments are confirmed by our admin after you send the money. Go to #/pricing and pick your plan to pay.'
+      return 'We accept 12 payment methods:\n\nMobile/Bank: bKash (01886822816), Nagad (01613822816), Rocket (Coming Soon), Bank Asia (account info after checkout), Card & PayPal.\nCrypto: Binance Pay, USDT (BEP20/TRC20), Solana, ETH, Arbitrum.\n\nCrypto payments are verified automatically on-chain in ~2 seconds via BscScan. bKash/Nagad/bank/Binance payments are confirmed by our admin after you send the money - you can submit an order ID, a TX hash, or a payment screenshot. Go to /pricing and pick your plan to pay.'
     case 'generator':
-      return 'Try our free Title Generator at #/generator. It uses real SERP data to build 15 SEO titles with real ranking scores - no fabricated templates. Login and generate now.'
+      return 'Try our free Title Generator at /generator. It uses real SERP data to build SEO titles with real ranking scores - no fabricated templates. Login and generate now.'
     case 'metadesc':
-      return 'Use the Meta Description Generator at #/tools. Type one or more keywords (comma-separated) and it writes AI meta descriptions with real scores.'
+      return 'Use the Meta Description Generator at /tools. Type one or more keywords (comma-separated) and it writes AI meta descriptions with real scores.'
     case 'tools':
-      return 'We have 10 free SEO tools - all with real analysis:\n• Keyword Research\n• SERP Analyzer\n• Title Generator\n• Meta Description Generator\n• PageSpeed Checker\n• Competitor Analysis\n• Question Finder (PAA)\n• Related Keywords\n• Keyword Difficulty\n• SEO Audit Score\n\nOpen #/tools to use them. You can now enter multiple comma-separated keywords in one go.'
+      return 'We have 10 free SEO tools - all with real analysis:\n• Keyword Research\n• SERP Analyzer\n• Title Generator\n• Meta Description Generator\n• PageSpeed Checker\n• Competitor Analysis\n• Question Finder (PAA)\n• Related Keywords\n• Keyword Difficulty\n• SEO Audit Score\n\nOpen /tools to use them. You can now enter multiple comma-separated keywords in one go.'
     case 'account':
-      return 'Register or login at #/auth - it takes seconds. After buying any paid plan your account becomes Premium Active instantly (crypto) or after admin approval (mobile/bank).'
+      return 'Register or login at /auth - it takes seconds. After buying any paid plan your account becomes Premium Active instantly (crypto) or after admin approval (mobile/bank).'
     case 'contact':
-      return 'Reach us anytime:\n• WhatsApp: +880 1886-822816\n• Telegram: t.me/+8801886822816\n• Or use this live chat - our team replies 24/7 for paid users.'
+      return 'Reach us anytime:\n• WhatsApp (human support): ' + SUPPORT_WHATSAPP + '\n• Telegram: t.me/+8801886822816\n• Or use this live chat - our AI answers instantly and a human agent can join when needed.'
     case 'ranking':
       return 'To rank higher on Google, work with real data from our free tools:\n\n1. Keyword Research - find keywords you can realistically win.\n2. SERP Analyzer - see who ranks and what content they use.\n3. Title Generator + Meta Description Generator - write click-worthy titles and descriptions.\n4. PageSpeed Checker + SEO Audit - find the technical issues slowing you down.\n\nConsistency matters: publish useful content regularly, get genuine backlinks, and keep your Core Web Vitals green. We never promise guaranteed rankings - that is against Google rules.'
     default:
@@ -754,7 +1065,7 @@ function chatPrompt(query, history) {
   const ctx = Array.isArray(history) && history.length
     ? '\n\nConversation history (most recent last):\n' + history.map(h => `${h.role === 'user' ? 'User' : 'Assistant'}: ${h.text}`).join('\n')
     : ''
-  return `You are the support assistant of SEOPro AI (monkeycode-ai.live), a real SEO tools and AI agents platform with 10 free tools (keyword research, SERP analyzer, title generator, meta description generator, PageSpeed checker, competitor analysis, question finder, related keywords, keyword difficulty, SEO audit), 19 agents, and 4 plans (Free $0, Starter $5, Pro $15, Agency $49 per month). Payments: bKash 01886822816, Nagad 01613822816, Rocket, Bank Asia, Binance Pay, USDT, Solana, ETH, Arbitrum, Card, PayPal. Crypto auto-verifies on-chain. Contact: WhatsApp 01886822816, Telegram t.me/+8801886822816. Answer directly, concisely and helpfully, in the user's language (Bengali if they write Bengali). Do not invent fake SERP data.${ctx}\n\nUser: ${query}`
+  return `You are the support assistant of SEOPro AI (monkeycode-ai.live), a real SEO tools and AI agents platform with 10 free tools (keyword research, SERP analyzer, title generator, meta description generator, PageSpeed checker, competitor analysis, question finder, related keywords, keyword difficulty, SEO audit), 19 agents, and 4 plans (Free $0, Starter $5, Pro $15, Agency $49 per month). Pages: / (home), /generator, /tools, /pricing, /dashboard, /auth. Payments: bKash 01886822816, Nagad 01613822816, Rocket, Bank Asia, Binance Pay, USDT, Solana, ETH, Arbitrum, Card, PayPal. For manual payments the user can submit an order ID, a TX hash, or a screenshot (any one is enough). Crypto auto-verifies on-chain. Human support: WhatsApp ${SUPPORT_WHATSAPP} (also available as a human agent in this live chat). Answer directly, concisely and helpfully, in the user's language (Bengali if they write Bengali). Only use the website information above; if you do not know something, tell the user to contact human support on WhatsApp ${SUPPORT_WHATSAPP}. Do not invent fake SERP data or make promises about rankings.${ctx}\n\nUser: ${query}`
 }
 
 function clampScore(s) {
@@ -1413,19 +1724,46 @@ app.get('/api/health', (req, res) => {
 app.post('/api/admin/login', authLimit, async (req, res) => {
   const email = String((req.body && req.body.email) || '').toLowerCase().trim()
   const password = String((req.body && req.body.password) || '')
-  if (!ADMIN_EMAILS.includes(email)) return res.status(401).json({ status: 'Error', error: 'Not an admin account' })
-  const acct = await loadAdminAccount(email)
-  let ok = false
-  if (acct && acct.hash) ok = verifyAdminPasswordHash(password, acct.hash)
-  if (!ok) ok = safeEqual(password, ADMIN_PASSWORD)
-  if (!ok) return res.status(401).json({ status: 'Error', error: 'Wrong admin password' })
-  res.json({ status: 'Real', email, token: makeAdminToken(email), expiresIn: ADMIN_TOKEN_TTL_MS })
+  const ip = clientIp(req)
+
+  // Owner/admin account
+  if (ADMIN_EMAILS.includes(email)) {
+    const acct = await loadAdminAccount(email)
+    let ok = false
+    if (acct && acct.hash) ok = verifyAdminPasswordHash(password, acct.hash)
+    if (!ok) ok = safeEqual(password, ADMIN_PASSWORD)
+    if (!ok) {
+      auditLog(email, 'admin_login_failed', 'admin', { reason: 'wrong_password' }, ip)
+      return res.status(401).json({ status: 'Error', error: 'Wrong admin password', compliance })
+    }
+    auditLog(email, 'admin_login', 'admin', { role: 'admin' }, ip)
+    return res.json({ status: 'Real', email, role: 'admin', permissions: ['all'], token: makeAdminToken(email, 'admin'), expiresIn: ADMIN_TOKEN_TTL_MS })
+  }
+
+  // Moderator account
+  const mods = await getModerators().catch(() => [])
+  const mod = mods.find(m => String(m.email || '').toLowerCase() === email)
+  if (mod) {
+    if (mod.active === false) return res.status(401).json({ status: 'Error', error: 'This moderator account is disabled', compliance })
+    if (!verifyAdminPasswordHash(password, mod.hash)) {
+      auditLog(email, 'moderator_login_failed', 'moderator', { reason: 'wrong_password' }, ip)
+      return res.status(401).json({ status: 'Error', error: 'Wrong moderator password', compliance })
+    }
+    const permissions = Array.isArray(mod.permissions) && mod.permissions.length ? mod.permissions : MODERATOR_DEFAULT_PERMISSIONS
+    mod.lastLoginAt = new Date().toISOString()
+    await kvSet(MODERATORS_KEY, mods).catch(() => {})
+    auditLog(email, 'moderator_login', 'moderator', { permissions }, ip)
+    return res.json({ status: 'Real', email, role: 'moderator', permissions, token: makeAdminToken(email, 'moderator', permissions), expiresIn: ADMIN_TOKEN_TTL_MS })
+  }
+
+  auditLog(email || 'unknown', 'login_failed', 'admin', { reason: 'not_admin' }, ip)
+  return res.status(401).json({ status: 'Error', error: 'Not an admin account', compliance })
 })
 
 app.get('/api/admin/verify', (req, res) => {
   const data = verifyAdminToken(req.headers['x-admin-token'])
   if (!data) return res.status(401).json({ status: 'Error', error: 'Invalid or expired admin session' })
-  res.json({ status: 'Real', email: data.email, expiresAt: data.exp })
+  res.json({ status: 'Real', email: data.email, role: data.role, permissions: data.permissions || null, expiresAt: data.exp })
 })
 
 // ---------------------------------------------------------------- admin account (password / recovery / phone)
@@ -1464,6 +1802,7 @@ app.post('/api/admin/account/password', authLimit, requireAdmin, async (req, res
   if (!supabaseReady()) return res.status(503).json({ status: 'Error', error: 'Server storage is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.', compliance })
   try {
     await saveAdminAccount(req.adminEmail, { hash: hashAdminPassword(newPassword), passwordChangedAt: new Date().toISOString() })
+    auditLog(req.adminEmail, 'admin_password_changed', 'admin', null, clientIp(req))
     res.json({ status: 'Real', changed: true, notice: 'Admin password updated. Use it from the next login.', compliance })
   } catch (e) {
     res.status(500).json({ status: 'Error', error: 'Could not save the new password. ' + String((e && e.message) || ''), compliance })
@@ -1476,6 +1815,7 @@ app.post('/api/admin/account/recovery', requireAdmin, async (req, res) => {
   if (!supabaseReady()) return res.status(503).json({ status: 'Error', error: 'Server storage is not configured.', compliance })
   try {
     await saveAdminAccount(req.adminEmail, { recoveryEmail })
+    auditLog(req.adminEmail, 'recovery_email_changed', recoveryEmail, null, clientIp(req))
     res.json({ status: 'Real', saved: true, recoveryEmail, notice: 'Recovery email saved.', compliance })
   } catch (e) {
     res.status(500).json({ status: 'Error', error: 'Could not save the recovery email.', compliance })
@@ -1509,6 +1849,7 @@ app.post('/api/admin/account/phone/verify', authLimit, requireAdmin, async (req,
   if (!v.ok) return res.status(400).json({ status: 'Error', error: v.error, compliance })
   try {
     await saveAdminAccount(req.adminEmail, { phone, phoneVerified: true, pendingPhone: null })
+    auditLog(req.adminEmail, 'recovery_phone_verified', maskContact('sms', phone), null, clientIp(req))
     res.json({ status: 'Real', phoneVerified: true, phone: maskContact('sms', phone), compliance })
   } catch (e) {
     res.status(500).json({ status: 'Error', error: 'Verified but could not save the number.', compliance })
@@ -1569,9 +1910,337 @@ app.post('/api/admin/account/reset', authLimit, async (req, res) => {
   resetTokens.delete(resetToken)
   try {
     await saveAdminAccount(email, { hash: hashAdminPassword(newPassword), passwordChangedAt: new Date().toISOString() })
+    auditLog(email, 'admin_password_reset', 'admin', { via: 'recovery' }, clientIp(req))
     res.json({ status: 'Real', reset: true, notice: 'Admin password updated. Sign in with the new password.', compliance })
   } catch (e) {
     res.status(500).json({ status: 'Error', error: 'Could not save the new password.', compliance })
+  }
+})
+
+// ---------------------------------------------------------------- site config (public)
+// Public, non-sensitive configuration the storefront reads: maintenance state,
+// registration toggle, live plans and enabled payment methods.
+app.get('/api/site-config', async (req, res) => {
+  try {
+    const [settings, plans, methods] = await Promise.all([getSiteSettings(), getPlans(), getPaymentMethods()])
+    res.json({
+      status: 'Real',
+      maintenance: !!settings.maintenance,
+      allowRegistration: settings.allowRegistration !== false,
+      concurrencyLimit: settings.concurrencyLimit,
+      plans: plans.filter(p => p.active !== false),
+      paymentMethods: methods.filter(m => m.enabled !== false),
+      updatedAt: settings.updatedAt || null
+    })
+  } catch (e) {
+    res.json({ status: 'Real', maintenance: false, allowRegistration: true, plans: [], paymentMethods: [] })
+  }
+})
+
+// ---------------------------------------------------------------- payment proof submissions
+// Users submit a manual payment proof for bKash/Bank/Binance Pay etc. Accepts
+// an order id, a transaction hash, a screenshot, or any combination; at least
+// one is required. Stored server-side so admins/moderators with access can
+// review it from any device (no dependency on new payments columns).
+const PAYMENT_PROOFS_KEY = 'payment_proofs'
+const PROOF_CAP = 1000
+const PROOF_IMAGE_RE = /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=]+$/
+
+app.post('/api/payment/proof', generalLimit, async (req, res) => {
+  const b = req.body || {}
+  const email = String(b.email || '').trim().toLowerCase()
+  const orderId = String(b.orderId || '').trim().slice(0, 120)
+  const trx = String(b.trx || '').trim().slice(0, 160)
+  const proofImage = typeof b.proofImage === 'string' ? b.proofImage : ''
+  if (!EMAIL_RE.test(email)) return res.status(400).json({ status: 'Error', error: 'A valid account email is required.', compliance })
+  if (!orderId && !trx && !proofImage) return res.status(400).json({ status: 'Error', error: 'Provide a Binance order ID, a transaction hash, or a payment screenshot.', compliance })
+  if (proofImage && (!PROOF_IMAGE_RE.test(proofImage) || proofImage.length > 2000000)) {
+    return res.status(400).json({ status: 'Error', error: 'Screenshot must be a PNG/JPG/WEBP/GIF image under 1.5 MB.', compliance })
+  }
+  const proof = {
+    id: newId('proof'),
+    email,
+    name: String(b.name || '').slice(0, 80),
+    plan: String(b.plan || '').slice(0, 40),
+    planName: String(b.planName || '').slice(0, 60),
+    amount: Number(b.amount) || 0,
+    method: String(b.method || '').slice(0, 60),
+    methodId: String(b.methodId || '').slice(0, 40),
+    trx,
+    orderId,
+    proofImage,
+    status: 'pending',
+    createdAt: new Date().toISOString()
+  }
+  try {
+    const list = (await kvGet(PAYMENT_PROOFS_KEY, [])) || []
+    const arr = Array.isArray(list) ? list : []
+    arr.unshift(proof)
+    // strip image bodies from older entries beyond a small window to keep storage small
+    const trimmed = arr.slice(0, 200)
+    await kvSet(PAYMENT_PROOFS_KEY, trimmed)
+    sysLog('info', 'payment-proof', 'Proof submitted for ' + proof.planName + ' via ' + proof.method, { email, orderId: orderId || null, hasImage: !!proofImage, trx: trx || null })
+    res.json({ status: 'Real', proof: { id: proof.id, status: proof.status, createdAt: proof.createdAt }, compliance })
+  } catch (e) {
+    res.status(500).json({ status: 'Error', error: 'Could not save the payment proof.', compliance })
+  }
+})
+
+app.get('/api/admin/payment-proofs', requireAdmin, async (req, res) => {
+  if (req.adminRole !== 'admin') return res.status(403).json({ status: 'Error', error: 'Only the owner can review payment proofs.', compliance })
+  const list = (await kvGet(PAYMENT_PROOFS_KEY, [])) || []
+  const arr = Array.isArray(list) ? list : []
+  res.json({ status: 'Real', proofs: arr.slice(0, 200), total: arr.length, compliance })
+})
+
+app.patch('/api/admin/payment-proofs/:id', requireAdmin, requireRole('admin'), async (req, res) => {
+  const status = String((req.body && req.body.status) || '').toLowerCase()
+  if (['approved', 'rejected', 'pending'].indexOf(status) < 0) return res.status(400).json({ status: 'Error', error: 'status must be approved, rejected or pending', compliance })
+  const list = (await kvGet(PAYMENT_PROOFS_KEY, [])) || []
+  const arr = Array.isArray(list) ? list : []
+  const proof = arr.find(p => p.id === req.params.id)
+  if (!proof) return res.status(404).json({ status: 'Error', error: 'Payment proof not found', compliance })
+  proof.status = status
+  proof.reviewedAt = new Date().toISOString()
+  proof.reviewedBy = req.adminEmail
+  await kvSet(PAYMENT_PROOFS_KEY, arr)
+  auditLog(req.adminEmail, 'payment_proof_' + status, proof.id, { email: proof.email, orderId: proof.orderId || null, trx: proof.trx || null, amount: proof.amount }, clientIp(req))
+  sysLog(status === 'approved' ? 'success' : 'warn', 'payment-proof', 'Proof ' + status + ' for ' + proof.email, { id: proof.id, amount: proof.amount })
+  res.json({ status: 'Real', proof, compliance })
+})
+
+// ---------------------------------------------------------------- logs (admin + moderator)
+async function requireLogAccess(req, res, next) {
+  if (req.adminRole === 'admin') return next()
+  const perms = req.adminPermissions || []
+  if (perms.indexOf('logs') >= 0) return next()
+  return res.status(403).json({ status: 'Error', error: 'Your role cannot view logs.', compliance })
+}
+
+app.get('/api/admin/logs', requireAdmin, requireLogAccess, async (req, res) => {
+  const limit = Number(req.query.limit) || 200
+  const type = String(req.query.type || 'all')
+  const out = { status: 'Real', concurrencyLimit: (await getSiteSettings()).concurrencyLimit, inFlight: INFLIGHT }
+  if (type === 'all' || type === 'system') out.system = await getLogs(SYSTEM_LOGS_KEY, limit)
+  if (type === 'all' || type === 'audit') out.audit = (req.adminRole === 'admin') ? await getLogs(AUDIT_LOGS_KEY, limit) : []
+  res.json(out)
+})
+
+app.post('/api/admin/logs/clear', requireAdmin, requireRole('admin'), async (req, res) => {
+  const type = String((req.body && req.body.type) || 'system')
+  if (type === 'audit') await clearLogs(AUDIT_LOGS_KEY)
+  else await clearLogs(SYSTEM_LOGS_KEY)
+  auditLog(req.adminEmail, 'logs_cleared', type, null, clientIp(req))
+  res.json({ status: 'Real', cleared: type, compliance })
+})
+
+// ---------------------------------------------------------------- settings / maintenance (admin)
+app.get('/api/admin/settings', requireAdmin, requireRole('admin'), async (req, res) => {
+  res.json({ status: 'Real', settings: await getSiteSettings(), compliance })
+})
+
+app.post('/api/admin/settings', requireAdmin, requireRole('admin'), async (req, res) => {
+  const b = req.body || {}
+  const patch = {}
+  if (b.maintenance !== undefined) patch.maintenance = !!b.maintenance
+  if (b.allowRegistration !== undefined) patch.allowRegistration = !!b.allowRegistration
+  if (b.concurrencyLimit !== undefined) patch.concurrencyLimit = Number(b.concurrencyLimit)
+  try {
+    const saved = await saveSiteSettings(patch, req.adminEmail)
+    auditLog(req.adminEmail, 'settings_updated', 'site_settings', patch, clientIp(req))
+    sysLog('info', 'settings', 'Site settings updated', patch)
+    res.json({ status: 'Real', settings: saved, compliance })
+  } catch (e) {
+    res.status(400).json({ status: 'Error', error: String((e && e.message) || 'Could not save settings'), compliance })
+  }
+})
+
+// ---------------------------------------------------------------- plans (admin)
+app.get('/api/admin/plans', requireAdmin, requireRole('admin'), async (req, res) => {
+  res.json({ status: 'Real', plans: await getPlans(), compliance })
+})
+
+app.post('/api/admin/plans', requireAdmin, requireRole('admin'), async (req, res) => {
+  try {
+    const plan = await savePlan(req.body || {}, req.adminEmail)
+    auditLog(req.adminEmail, 'plan_saved', plan.id, { name: plan.name, price: plan.price }, clientIp(req))
+    res.json({ status: 'Real', plan, plans: await getPlans(), compliance })
+  } catch (e) {
+    res.status(400).json({ status: 'Error', error: String((e && e.message) || 'Could not save plan'), compliance })
+  }
+})
+
+app.delete('/api/admin/plans/:id', requireAdmin, requireRole('admin'), async (req, res) => {
+  const removed = await deletePlan(req.params.id, req.adminEmail)
+  if (removed) auditLog(req.adminEmail, 'plan_deleted', req.params.id, null, clientIp(req))
+  res.json({ status: 'Real', removed, plans: await getPlans(), compliance })
+})
+
+// ---------------------------------------------------------------- payment methods (admin)
+app.get('/api/admin/payment-methods', requireAdmin, requireRole('admin'), async (req, res) => {
+  res.json({ status: 'Real', methods: await getPaymentMethods(), compliance })
+})
+
+app.post('/api/admin/payment-methods', requireAdmin, requireRole('admin'), async (req, res) => {
+  try {
+    const method = await savePaymentMethod(req.body || {}, req.adminEmail)
+    auditLog(req.adminEmail, 'payment_method_saved', method.id, { label: method.label, enabled: method.enabled }, clientIp(req))
+    res.json({ status: 'Real', method, methods: await getPaymentMethods(), compliance })
+  } catch (e) {
+    res.status(400).json({ status: 'Error', error: String((e && e.message) || 'Could not save payment method'), compliance })
+  }
+})
+
+app.delete('/api/admin/payment-methods/:id', requireAdmin, requireRole('admin'), async (req, res) => {
+  const removed = await deletePaymentMethod(req.params.id, req.adminEmail)
+  if (removed) auditLog(req.adminEmail, 'payment_method_deleted', req.params.id, null, clientIp(req))
+  res.json({ status: 'Real', removed, methods: await getPaymentMethods(), compliance })
+})
+
+// ---------------------------------------------------------------- moderators (admin)
+app.get('/api/admin/moderators', requireAdmin, requireRole('admin'), async (req, res) => {
+  const mods = await getModerators()
+  res.json({ status: 'Real', moderators: mods.map(publicModerator), allowedPermissions: MODERATOR_DEFAULT_PERMISSIONS, compliance })
+})
+
+app.post('/api/admin/moderators', requireAdmin, requireRole('admin'), async (req, res) => {
+  try {
+    const mod = await createModerator(req.body || {}, req.adminEmail)
+    auditLog(req.adminEmail, 'moderator_created', mod.id, { email: mod.email }, clientIp(req))
+    res.json({ status: 'Real', moderator: mod, moderators: (await getModerators()).map(publicModerator), compliance })
+  } catch (e) {
+    res.status(400).json({ status: 'Error', error: String((e && e.message) || 'Could not create moderator'), compliance })
+  }
+})
+
+app.patch('/api/admin/moderators/:id', requireAdmin, requireRole('admin'), async (req, res) => {
+  try {
+    const mod = await updateModerator(req.params.id, req.body || {}, req.adminEmail)
+    auditLog(req.adminEmail, 'moderator_updated', mod.id, { email: mod.email, active: mod.active }, clientIp(req))
+    res.json({ status: 'Real', moderator: mod, moderators: (await getModerators()).map(publicModerator), compliance })
+  } catch (e) {
+    res.status(400).json({ status: 'Error', error: String((e && e.message) || 'Could not update moderator'), compliance })
+  }
+})
+
+app.delete('/api/admin/moderators/:id', requireAdmin, requireRole('admin'), async (req, res) => {
+  const removed = await deleteModerator(req.params.id, req.adminEmail)
+  if (removed) auditLog(req.adminEmail, 'moderator_deleted', req.params.id, null, clientIp(req))
+  res.json({ status: 'Real', removed, moderators: (await getModerators()).map(publicModerator), compliance })
+})
+
+// ---------------------------------------------------------------- admin audit trail (from UI actions)
+app.post('/api/admin/audit', requireAdmin, async (req, res) => {
+  const b = req.body || {}
+  const action = String(b.action || '').slice(0, 60)
+  if (!action) return res.status(400).json({ status: 'Error', error: 'action is required', compliance })
+  auditLog(req.adminEmail, action, b.target ? String(b.target).slice(0, 80) : null, b.meta || null, clientIp(req))
+  res.json({ status: 'Real', logged: true, compliance })
+})
+
+// ---------------------------------------------------------------- live chat (admin + moderator)
+async function supaChatRows(query) {
+  if (!supabaseReady()) return null
+  const r = await fetch(SUPABASE_URL + '/rest/v1/chats?' + query, { headers: supaHeaders() })
+  if (!r.ok) throw new Error('chat read ' + r.status)
+  return await r.json()
+}
+
+app.get('/api/admin/chats', requireAdmin, async (req, res) => {
+  if (req.adminRole !== 'admin' && (req.adminPermissions || []).indexOf('chats') < 0) {
+    return res.status(403).json({ status: 'Error', error: 'Your role cannot access live chat.', compliance })
+  }
+  try {
+    if (!supabaseReady()) return res.json({ status: 'Real', chats: [], storageReady: false, compliance })
+    const rows = await supaChatRows('select=id,client_ref,email,name,messages,user_unread,admin_unread,updated_at&order=updated_at.desc&limit=100')
+    res.json({ status: 'Real', chats: rows || [], storageReady: true, compliance })
+  } catch (e) {
+    res.status(502).json({ status: 'Error', error: 'Could not load chats: ' + String((e && e.message) || ''), compliance })
+  }
+})
+
+app.post('/api/admin/chats/reply', requireAdmin, async (req, res) => {
+  if (req.adminRole !== 'admin' && (req.adminPermissions || []).indexOf('chats') < 0) {
+    return res.status(403).json({ status: 'Error', error: 'Your role cannot reply to live chat.', compliance })
+  }
+  const email = String((req.body && req.body.email) || '').toLowerCase().trim()
+  const text = String((req.body && req.body.text) || '').trim().slice(0, 2000)
+  if (!email || !text) return res.status(400).json({ status: 'Error', error: 'email and text are required', compliance })
+  if (!supabaseReady()) return res.status(503).json({ status: 'Error', error: 'Server storage is not configured.', compliance })
+  try {
+    const rows = await supaChatRows('select=id,messages&email=eq.' + encodeURIComponent(email) + '&limit=1')
+    const row = rows && rows[0]
+    if (!row) return res.status(404).json({ status: 'Error', error: 'Chat not found for that user.', compliance })
+    const messages = Array.isArray(row.messages) ? row.messages : []
+    messages.push({ from: 'admin', text, at: new Date().toISOString(), by: req.adminEmail, role: req.adminRole })
+    const up = await fetch(SUPABASE_URL + '/rest/v1/chats?id=eq.' + encodeURIComponent(row.id), {
+      method: 'PATCH',
+      headers: supaHeaders({ Prefer: 'return=minimal' }),
+      body: JSON.stringify({ messages, admin_unread: 0, updated_at: new Date().toISOString() })
+    })
+    if (!up.ok) throw new Error('chat update ' + up.status)
+    auditLog(req.adminEmail, 'chat_reply', email, { role: req.adminRole }, clientIp(req))
+    res.json({ status: 'Real', replied: true, compliance })
+  } catch (e) {
+    res.status(502).json({ status: 'Error', error: 'Could not send reply: ' + String((e && e.message) || ''), compliance })
+  }
+})
+
+// ---------------------------------------------------------------- broadcast + create user
+app.post('/api/admin/chats/broadcast', requireAdmin, requireRole('admin'), async (req, res) => {
+  const text = String((req.body && req.body.text) || '').trim().slice(0, 2000)
+  if (!text) return res.status(400).json({ status: 'Error', error: 'Broadcast text is required', compliance })
+  if (!supabaseReady()) return res.status(503).json({ status: 'Error', error: 'Server storage is not configured.', compliance })
+  try {
+    const rows = await supaChatRows('select=id,messages,user_unread&limit=1000')
+    let sent = 0
+    for (const row of (rows || [])) {
+      const messages = Array.isArray(row.messages) ? row.messages : []
+      messages.push({ from: 'admin', text, at: new Date().toISOString(), by: req.adminEmail, role: 'admin', broadcast: true })
+      const up = await fetch(SUPABASE_URL + '/rest/v1/chats?id=eq.' + encodeURIComponent(row.id), {
+        method: 'PATCH', headers: supaHeaders({ Prefer: 'return=minimal' }),
+        body: JSON.stringify({ messages, user_unread: (Number(row.user_unread) || 0) + 1, updated_at: new Date().toISOString() })
+      })
+      if (up.ok) sent++
+    }
+    auditLog(req.adminEmail, 'chat_broadcast', 'all-users', { sent, text: text.slice(0, 80) }, clientIp(req))
+    sysLog('info', 'chat', 'Broadcast sent to ' + sent + ' user(s)')
+    res.json({ status: 'Real', sent, compliance })
+  } catch (e) {
+    res.status(502).json({ status: 'Error', error: 'Broadcast failed: ' + String((e && e.message) || ''), compliance })
+  }
+})
+
+app.post('/api/admin/users', requireAdmin, requireRole('admin'), async (req, res) => {
+  const name = String((req.body && req.body.name) || '').trim().slice(0, 80)
+  const email = String((req.body && req.body.email) || '').trim().toLowerCase()
+  const password = String((req.body && req.body.password) || '')
+  if (!name) return res.status(400).json({ status: 'Error', error: 'User name is required', compliance })
+  if (!EMAIL_RE.test(email)) return res.status(400).json({ status: 'Error', error: 'Enter a valid email address', compliance })
+  if (password.length < 8) return res.status(400).json({ status: 'Error', error: 'Password must be at least 8 characters', compliance })
+  if (!supabaseReady()) return res.status(503).json({ status: 'Error', error: 'Server storage is not configured.', compliance })
+  try {
+    const r = await fetch(SUPABASE_URL + '/auth/v1/admin/users', {
+      method: 'POST',
+      headers: supaHeaders({ Prefer: 'return=representation' }),
+      body: JSON.stringify({ email, password, email_confirm: true, user_metadata: { name, created_by: req.adminEmail } })
+    })
+    if (!r.ok) {
+      const body = await r.text().catch(() => '')
+      return res.status(400).json({ status: 'Error', error: 'Could not create user: ' + body.slice(0, 200), compliance })
+    }
+    const data = await r.json()
+    const uid = data && (data.id || (data.user && data.user.id))
+    if (uid) {
+      await fetch(SUPABASE_URL + '/rest/v1/profiles?on_conflict=id', {
+        method: 'POST', headers: supaHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify([{ id: uid, name, email }])
+      }).catch(() => {})
+    }
+    auditLog(req.adminEmail, 'user_created', email, { uid }, clientIp(req))
+    res.json({ status: 'Real', user: { id: uid, name, email }, compliance })
+  } catch (e) {
+    res.status(502).json({ status: 'Error', error: 'Could not create user: ' + String((e && e.message) || ''), compliance })
   }
 })
 
@@ -1789,7 +2458,7 @@ app.post('/api/chat', chatLimit, async (req, res) => {
     const ai = await callGemini(chatPrompt(message, messages))
     if (ai.status === 'Real') { reply = ai.text; source = 'gemini' }
     else {
-      reply = 'I understood your question but live AI answering is temporarily unavailable. For now I can help with pricing, tools, the generator or contact info - or reach a human on WhatsApp 01886822816.'
+      reply = 'I understood your question but live AI answering is temporarily unavailable. For now I can help with pricing, tools, the generator or contact info - or reach a human on WhatsApp ' + SUPPORT_WHATSAPP + '.'
       source = 'fallback'
     }
   }

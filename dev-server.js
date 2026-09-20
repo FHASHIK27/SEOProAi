@@ -119,7 +119,9 @@ http.createServer((req, res) => {
   const retry = rateLimited(req, 600, 5 * 60 * 1000)
   if (retry) { res.setHeader('Retry-After', String(retry)); return deny(res, 429, 'Too many requests. Please slow down.') }
 
-  const urlPath = rawPath === '/' ? '/index.html' : rawPath
+  const ROUTE_FALLBACKS = new Set(['/generator', '/tools', '/pricing', '/dashboard', '/admin', '/auth'])
+  let urlPath = rawPath === '/' ? '/index.html' : rawPath
+  if (ROUTE_FALLBACKS.has(urlPath)) urlPath = '/index.html'
   if (!PUBLIC_FILES.has(urlPath)) return deny(res, 404, 'Not found')
 
   const filePath = path.normalize(path.join(ROOT, urlPath))
