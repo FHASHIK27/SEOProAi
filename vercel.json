@@ -14,12 +14,12 @@
     "api/index.js": {
       "includeFiles": "backend/**",
       "memory": 1024,
-      "maxDuration": 30
+      "maxDuration": 60
     },
     "api/[...path].js": {
       "includeFiles": "backend/**",
       "memory": 1024,
-      "maxDuration": 30
+      "maxDuration": 60
     }
   },
   "headers": [

@@ -353,14 +353,23 @@ function fetchTimeout(url, opts = {}, ms = 20000) {
 
 function devStoredKey() { try { return localStorage.getItem('seoproDevKey') || '' } catch (e) { return '' } }
 
+async function parseApiResponse(r) {
+  const text = await r.text()
+  try { return JSON.parse(text) } catch (e) {
+    if (r.status >= 500) return { status: 'Error', reason: 'The server hit an error (' + r.status + '). Please try again in a moment.' }
+    return { status: 'Error', reason: 'Unexpected server response (' + r.status + ').' }
+  }
+}
+
 async function apiGet(path, timeoutMs) {
   try {
     const k = devStoredKey()
     const opts = k ? { headers: { 'x-dev-key': k } } : {}
     const r = await fetchTimeout(API + path, opts, timeoutMs)
-    return await r.json()
+    return await parseApiResponse(r)
   } catch (e) {
-    return { status: 'Error', reason: 'Backend offline. Start it with: cd backend && npm install && node server.js' }
+    const timeout = e && e.name === 'AbortError'
+    return { status: 'Error', reason: timeout ? 'This analysis took too long and timed out. Please try again.' : 'Backend offline. Start it with: cd backend && npm install && node server.js' }
   }
 }
 
@@ -370,9 +379,10 @@ async function apiPost(path, body, timeoutMs) {
     const headers = { 'Content-Type': 'application/json' }
     if (k) headers['x-dev-key'] = k
     const r = await fetchTimeout(API + path, { method: 'POST', headers, body: JSON.stringify(body) }, timeoutMs)
-    return await r.json()
+    return await parseApiResponse(r)
   } catch (e) {
-    return { status: 'Error', reason: 'Backend offline. Start it with: cd backend && npm install && node server.js' }
+    const timeout = e && e.name === 'AbortError'
+    return { status: 'Error', reason: timeout ? 'This request took too long and timed out. Please try again.' : 'Backend offline. Start it with: cd backend && npm install && node server.js' }
   }
 }
 
@@ -390,6 +400,34 @@ async function apiAdmin(path, body, method) {
 }
 
 /* ============================================================== ui helpers */
+
+async function loadSiteConfig() {
+  try {
+    const r = await fetchTimeout(API + '/api/site-config', {}, 12000)
+    const j = await r.json()
+    if (j && j.status === 'Real') window.__siteConfig = j
+  } catch (e) { /* non-fatal */ }
+}
+
+function deliveryCfg() {
+  const d = window.__siteConfig && window.__siteConfig.delivery
+  return d || { email: false, emailProvider: null, phone: false, phoneProvider: null, whatsapp: false, sms: false }
+}
+
+async function apiUser(path, body) {
+  try {
+    let token = ''
+    try { if (cloudOn() && window.SeoCloud.accessToken) token = await window.SeoCloud.accessToken() } catch (e) {}
+    const headers = { 'Content-Type': 'application/json' }
+    if (token) headers['x-user-token'] = token
+    const opts = { method: body ? 'POST' : 'GET', headers }
+    if (body) opts.body = JSON.stringify(body)
+    const r = await fetchTimeout(API + path, opts, 25000)
+    return await r.json()
+  } catch (e) {
+    return { status: 'Error', error: 'Backend unreachable. Please try again.' }
+  }
+}
 
 function toast(msg, type = 'success') {
   const root = document.getElementById('toastRoot')
@@ -1272,7 +1310,7 @@ async function runTool(toolId) {
       html = '<div class="alert alert-error">' + esc(res.reason || 'Gemini unavailable') + '</div>' + localMetaFallbackHtml(value)
     }
   } else if (toolId === 'pagespeed' || toolId === 'seo-audit') {
-    const res = await apiGet('/api/pagespeed?url=' + encodeURIComponent(value) + '&email=' + encodeURIComponent(email) + '&plan=' + encodeURIComponent(planIdFor(email)))
+    const res = await apiGet('/api/pagespeed?url=' + encodeURIComponent(value) + '&email=' + encodeURIComponent(email) + '&plan=' + encodeURIComponent(planIdFor(email)), 55000)
     if (res.status === 'Real') {
       const m = res.metrics || {}
       const cats = [['Performance', res.performance], ['SEO', res.seo], ['Best Practices', res.bestPractices], ['Accessibility', res.accessibility]]
@@ -1501,6 +1539,11 @@ function dashboardView() {
         ownerBlock +
         '<div class="phone-block mt-16"><div class="p-label small muted">Mobile number (for password recovery)</div>' + phoneLine +
         '<button class="btn btn-ghost btn-sm mt-8" data-verify-phone type="button">' + (u.phoneVerified ? 'Change / re-verify number' : 'Add & verify number') + '</button></div>' +
+        '<div class="phone-block mt-16"><div class="p-label small muted">Recovery email (for password reset)</div>' +
+        (u.recoveryEmail
+          ? '<div class="phone-line"><b>' + esc(u.recoveryEmail) + '</b> <span class="label-pill label-good">SET</span></div>'
+          : '<div class="phone-line muted small">No recovery email linked yet</div>') +
+        '<button class="btn btn-ghost btn-sm mt-8" data-recovery-email type="button">' + (u.recoveryEmail ? 'Change recovery email' : 'Add recovery email') + '</button></div>' +
         '<div class="profile-stats">' +
           '<div class="ps"><b>' + (premium ? premium.daily : 3) + '</b><span>Daily credits</span></div>' +
           '<div class="ps"><b>' + daily + '</b><span>Used today</span></div>' +
@@ -1790,6 +1833,16 @@ function adminTabContent() {
           '<button class="btn btn-primary" id="acctPhoneVerifyBtn" type="button">Verify number</button>' +
           '<div id="acctPhoneMsg" class="mt-8"></div>' +
         '</div>' +
+      '</div>' +
+      '<div class="form-card mt-16"><h4>Delivery providers (email / WhatsApp)</h4>' +
+        '<p class="small muted">Real delivery status. Test-send a code to confirm messages actually arrive.</p>' +
+        '<div id="deliveryStatus" class="small mt-8">Loading...</div>' +
+        '<div class="grid grid-3 mt-16" style="gap:12px">' +
+          '<div class="field"><label>Channel</label><select id="dvChannel"><option value="email">Email</option><option value="whatsapp">WhatsApp</option><option value="sms">SMS</option></select></div>' +
+          aField('Send test to', 'dvContact', 'text', 'you@example.com or +8801...') +
+        '</div>' +
+        '<button class="btn btn-primary" id="dvTestBtn" type="button">Send test message</button>' +
+        '<div id="dvMsg" class="mt-8"></div>' +
       '</div>'
   }
   if (state.adminTab === 'dev') {
@@ -1878,7 +1931,32 @@ function bindAdminAccount() {
     if (res && res.phoneVerified) adminAccountLoad()
   })
 
+  loadDeliveryStatus()
+  const dvBtn = document.getElementById('dvTestBtn')
+  if (dvBtn) dvBtn.addEventListener('click', async () => {
+    const channel = ((document.getElementById('dvChannel') || {}).value || 'email')
+    const contact = ((document.getElementById('dvContact') || {}).value || '').trim()
+    if (!contact) { aMsg('dvMsg', 'Enter a recipient for the test message.', false); return }
+    dvBtn.disabled = true
+    const res = await apiAdmin('/api/admin/delivery/test', { channel, contact })
+    dvBtn.disabled = false
+    aMsg('dvMsg', (res && (res.error || ('Test message sent to ' + (res.to || contact) + ' via ' + channel + '.'))) || 'Could not send the test message.', !!(res && res.sent))
+  })
+
   adminAccountLoad()
+}
+
+async function loadDeliveryStatus() {
+  const el = document.getElementById('deliveryStatus')
+  if (!el) return
+  const res = await apiAdmin('/api/admin/delivery', null, 'GET')
+  if (!res || res.status !== 'Real') { el.innerHTML = esc((res && res.error) || 'Could not load delivery status.'); return }
+  const d = res.delivery || {}
+  const pill = ok => ok ? '<span class="label-pill label-good">configured</span>' : '<span class="label-pill label-veryhigh">missing</span>'
+  el.innerHTML =
+    '<div>Email: ' + pill(d.email) + ' ' + esc(d.emailProvider || 'not configured') + '</div>' +
+    '<div>WhatsApp: ' + pill(d.whatsapp) + ' ' + esc(d.phoneProvider || 'not configured') + '</div>' +
+    '<div>SMS: ' + pill(d.sms) + '</div>'
 }
 
 /* ---------- admin: plans / payment methods / moderators / logs / settings ---------- */
@@ -2881,10 +2959,113 @@ function devInboxHtml(res) {
 
 function openForgotFlow() {
   const u = currentUser()
+  if (cloudOn() && window.SeoCloud) { openServerForgot(u); return }
   otpState = { mode: 'reset', channel: null, contact: null, targetUser: null, resetToken: null, sending: false, prefillEmail: u ? u.email : '' }
   const box = otpModal('Reset your password', 'We will send a one-time code to your email or your verified mobile number. Codes expire in 5 minutes and are single-use.')
   otpState.box = box
   fpStepAccount()
+}
+
+/* Server-driven reset (works for real Supabase accounts, uses recovery email). */
+function openServerForgot(u) {
+  otpState = { mode: 'server-reset', purpose: 'reset', email: '', sent: null, resetToken: null, sending: false, prefillEmail: u ? u.email : '' }
+  const box = otpModal('Reset your password', 'Enter your account email. If a recovery email is saved we send the code there, otherwise to the account email. Codes expire in 5 minutes.', true)
+  otpState.box = box
+  fpServerEmail()
+}
+
+function fpServerEmail() {
+  const box = otpState.box
+  if (!box) return
+  box.innerHTML =
+    '<div class="field mt-8"><label>Account email</label><input type="email" id="fpEmail" placeholder="you@example.com" value="' + esc(otpState.prefillEmail || '') + '" autocomplete="off"></div>' +
+    '<button class="btn btn-primary" id="fpAccountBtn" style="width:100%" type="button">Send reset code</button>' +
+    '<div id="fpMsg"></div>' +
+    '<div class="small muted mt-16">No account? <a href="#" data-close-modal>Register here</a>.</div>'
+  const emailInput = box.querySelector('#fpEmail')
+  const go = async () => {
+    const email = (emailInput.value || '').trim().toLowerCase()
+    const msgEl = box.querySelector('#fpMsg')
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { if (msgEl) msgEl.innerHTML = otpErrorHtml('Enter a valid email address'); return }
+    const btn = box.querySelector('#fpAccountBtn')
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Sending...' }
+    const res = await apiPost('/api/account/forgot', { email })
+    if (btn) { btn.disabled = false; btn.textContent = 'Send reset code' }
+    if (!res || res.status !== 'Real') { if (msgEl) msgEl.innerHTML = otpErrorHtml((res && res.error) || 'Could not send the code. Please try again.'); return }
+    otpState.email = email
+    otpState.sent = res
+    fpServerCode()
+  }
+  const btn = box.querySelector('#fpAccountBtn')
+  if (btn) btn.addEventListener('click', go)
+  if (emailInput) { emailInput.focus(); emailInput.addEventListener('keydown', e => { if (e.key === 'Enter') go() }) }
+}
+
+function fpServerCode() {
+  const box = otpState.box
+  if (!box) return
+  const sent = otpState.sent || {}
+  box.innerHTML =
+    '<p class="muted small mt-8">Enter the 6-digit code sent to <b>' + esc(sent.contact || otpState.email) + '</b>' + (sent.viaRecovery ? ' (your recovery email)' : '') + '.</p>' +
+    devInboxHtml(sent) +
+    '<div class="field mt-8"><label>One-time code</label><input type="text" id="otpCode" inputmode="numeric" maxlength="6" placeholder="6-digit code" value="' + (sent.dev ? esc(sent.code) : '') + '" autocomplete="one-time-code"></div>' +
+    '<button class="btn btn-primary" id="otpVerifyBtn" style="width:100%" type="button">Verify code</button>' +
+    '<div class="small muted center mt-12"><a href="#" data-otp-resend>Resend code</a></div>' +
+    '<div id="fpMsg"></div>'
+  const codeInput = box.querySelector('#otpCode')
+  const verify = async () => {
+    const msgEl = box.querySelector('#fpMsg')
+    const code = (codeInput.value || '').trim()
+    if (!/^\d{6}$/.test(code)) { if (msgEl) msgEl.innerHTML = otpErrorHtml('Enter the 6-digit code'); return }
+    const btn = box.querySelector('#otpVerifyBtn')
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Verifying...' }
+    const res = await apiPost('/api/account/forgot/verify', { email: otpState.email, code })
+    if (btn) { btn.disabled = false; btn.textContent = 'Verify code' }
+    if (!res || res.status !== 'Real') { if (msgEl) msgEl.innerHTML = otpErrorHtml((res && res.error) || 'Verification failed'); return }
+    otpState.resetToken = res.resetToken
+    fpServerNewPassword()
+  }
+  const vBtn = box.querySelector('#otpVerifyBtn')
+  if (vBtn) vBtn.addEventListener('click', verify)
+  if (codeInput) codeInput.addEventListener('keydown', e => { if (e.key === 'Enter') verify() })
+  const resend = box.querySelector('[data-otp-resend]')
+  if (resend) resend.addEventListener('click', async e => {
+    e.preventDefault()
+    const msgEl = box.querySelector('#fpMsg')
+    const res = await apiPost('/api/account/forgot', { email: otpState.email })
+    if (res && res.status === 'Real') { otpState.sent = res; fpServerCode() }
+    else if (msgEl) msgEl.innerHTML = otpErrorHtml((res && res.error) || 'Could not resend the code.')
+  })
+}
+
+function fpServerNewPassword() {
+  const box = otpState.box
+  if (!box) return
+  box.innerHTML =
+    '<div class="alert alert-info">Code verified. Set a new password now.</div>' +
+    '<div class="field mt-8"><label>New password</label><input type="password" id="np1" placeholder="At least 6 characters" autocomplete="new-password"></div>' +
+    '<div class="field"><label>Confirm new password</label><input type="password" id="np2" placeholder="Repeat new password" autocomplete="new-password"></div>' +
+    '<button class="btn btn-primary" id="npBtn" style="width:100%" type="button">Reset password</button>' +
+    '<div id="fpMsg"></div>'
+  const p1 = box.querySelector('#np1')
+  const p2 = box.querySelector('#np2')
+  const submit = async () => {
+    const msgEl = box.querySelector('#fpMsg')
+    if ((p1.value || '').length < 6) { if (msgEl) msgEl.innerHTML = otpErrorHtml('Password must be at least 6 characters'); return }
+    if (p1.value !== p2.value) { if (msgEl) msgEl.innerHTML = otpErrorHtml('Passwords do not match'); return }
+    const btn = box.querySelector('#npBtn')
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Resetting...' }
+    const res = await apiPost('/api/account/reset', { email: otpState.email, resetToken: otpState.resetToken, newPassword: p1.value })
+    if (btn) { btn.disabled = false; btn.textContent = 'Reset password' }
+    if (!res || res.status !== 'Real') { if (msgEl) msgEl.innerHTML = otpErrorHtml((res && res.error) || 'Reset failed. Request a new code.'); return }
+    closeModal()
+    toast('Password updated - please sign in with the new password')
+    go('/auth')
+  }
+  const btn = box.querySelector('#npBtn')
+  if (btn) btn.addEventListener('click', submit)
+  if (p1) p1.addEventListener('keydown', e => { if (e.key === 'Enter') submit() })
+  if (p2) p2.addEventListener('keydown', e => { if (e.key === 'Enter') submit() })
 }
 
 function fpStepAccount() {
@@ -2915,16 +3096,20 @@ function fpStepChannel() {
   const box = otpState.box
   if (!box) return
   const target = otpState.targetUser
+  const cfg = deliveryCfg()
   const hasPhone = target.phoneVerified && target.phone
+  const phoneButtons = (hasPhone && (cfg.whatsapp || cfg.sms))
+    ? (cfg.whatsapp ? '<button class="btn btn-ghost" data-otp-channel="whatsapp" type="button">WhatsApp a code<br><span class="small muted">' + esc(maskPhone(target.phone)) + '</span></button>' : '') +
+      (cfg.sms ? '<button class="btn btn-ghost" data-otp-channel="sms" type="button">SMS a code<br><span class="small muted">' + esc(maskPhone(target.phone)) + '</span></button>' : '')
+    : ''
   box.innerHTML =
     '<p class="muted small mt-8">How do you want to receive the reset code for <b>' + esc(target.email) + '</b>?</p>' +
     '<div class="otp-channels">' +
       '<button class="btn btn-ghost" data-otp-channel="email" type="button">Email me a code<br><span class="small muted">' + esc(target.email) + '</span></button>' +
-      (hasPhone
-        ? '<button class="btn btn-ghost" data-otp-channel="whatsapp" type="button">WhatsApp a code<br><span class="small muted">' + esc(maskPhone(target.phone)) + '</span></button>' +
-          '<button class="btn btn-ghost" data-otp-channel="sms" type="button">SMS a code<br><span class="small muted">' + esc(maskPhone(target.phone)) + '</span></button>'
-        : '<div class="small muted otp-nophone">No verified mobile number yet - <a href="#" data-fp-nophone>add & verify one first</a> (you will need your current password).</div>') +
+      phoneButtons +
+      (hasPhone ? '' : '<div class="small muted otp-nophone">No verified mobile number yet - <a href="#" data-fp-nophone>add & verify one first</a> (you will need your current password).</div>') +
     '</div>' +
+    (phoneButtons ? '' : '<div class="small muted mt-8">WhatsApp / SMS recovery is not switched on yet, so email is the active channel.</div>') +
     '<div id="fpMsg"></div>'
   if (!hasPhone) {
     const addLink = box.querySelector('[data-fp-nophone]')
@@ -2950,12 +3135,15 @@ async function otpSendAndStep() {
   const box = otpState.box
   if (!box || otpState.sending) return
   otpState.sending = true
-  const msgEl = box.querySelector('#fpMsg')
-  if (msgEl) msgEl.innerHTML = '<div class="center muted small"><span class="spinner"></span> Sending code...</div>'
-  const res = await apiPost('/api/otp/send', { contact: otpState.contact, channel: otpState.channel, purpose: otpState.purpose })
+  box.innerHTML = '<div class="center muted small mt-8"><span class="spinner"></span> Sending code...</div>'
+  const res = await apiPost('/api/otp/send', { contact: otpState.contact, channel: otpState.channel, purpose: otpState.purpose }, 30000)
   otpState.sending = false
   if (!res || res.status !== 'Real') {
-    if (msgEl) msgEl.innerHTML = otpErrorHtml((res && res.error) || 'Could not send the code. Check backend/.env and the backend server.')
+    const detail = (res && (res.error || res.reason)) || 'Could not send the code.'
+    box.innerHTML = otpErrorHtml(detail) +
+      '<button class="btn btn-primary mt-8" id="otpRetryBtn" type="button" style="width:100%">Try again</button>'
+    const retry = box.querySelector('#otpRetryBtn')
+    if (retry) retry.addEventListener('click', () => otpSendAndStep())
     return
   }
   otpState.sent = res
@@ -3087,12 +3275,15 @@ function phoneStepNumber() {
   const box = otpState.box
   if (!box) return
   const existing = otpState.targetUser.phone || ''
+  const cfg = deliveryCfg()
+  const buttons =
+    (cfg.whatsapp ? '<button class="btn btn-ghost" data-pv-channel="whatsapp" type="button">Send code via WhatsApp</button>' : '') +
+    (cfg.sms ? '<button class="btn btn-ghost" data-pv-channel="sms" type="button">Send code via SMS</button>' : '')
   box.innerHTML =
     '<div class="field mt-8"><label>Mobile number (with country code)</label><input type="tel" id="pvPhone" placeholder="+8801XXXXXXXXX" value="' + esc(existing) + '" autocomplete="tel"></div>' +
-    '<div class="otp-channels">' +
-      '<button class="btn btn-ghost" data-pv-channel="whatsapp" type="button">Send code via WhatsApp</button>' +
-      '<button class="btn btn-ghost" data-pv-channel="sms" type="button">Send code via SMS</button>' +
-    '</div>' +
+    (buttons
+      ? '<div class="otp-channels">' + buttons + '</div>'
+      : '<div class="alert alert-error">WhatsApp and SMS delivery are not switched on yet, so a number cannot be verified right now. Add a recovery email instead from your dashboard.</div>') +
     '<div id="fpMsg"></div>'
   const send = async (channel) => {
     const msgEl = box.querySelector('#fpMsg')
@@ -3120,6 +3311,103 @@ function otpVerifiedSave() {
   toast('Mobile number verified - ' + maskPhone(otpState.contact))
   closeModal()
   if (pathFromLocation() === '/dashboard') navigate()
+}
+
+/* ---------- recovery email (logged in) ---------- */
+
+let recState = null
+
+async function loadMyRecoveryEmail() {
+  if (!cloudOn() || !currentUser()) return
+  const res = await apiUser('/api/account/recovery-email')
+  if (!res || res.status !== 'Real') return
+  const users = store.users()
+  const u = users.find(x => x.email === currentUser().email)
+  if (!u) return
+  if ((u.recoveryEmail || '') !== (res.email || '')) {
+    u.recoveryEmail = res.email || ''
+    store.saveUsers(users)
+    navigate()
+  }
+}
+
+function openRecoveryEmail() {
+  const u = currentUser()
+  if (!u) { toast('Please login first', 'error'); go('/auth'); return }
+  if (!cloudOn()) { toast('Recovery email needs the cloud backend', 'error'); return }
+  recState = { box: null, email: '', sent: null, sending: false }
+  const box = otpModal('Recovery email', 'Add an email that can receive your password-reset code if you ever lose access to your account.', true)
+  recState.box = box
+  recStepEmail()
+}
+
+function recStepEmail() {
+  const box = recState.box
+  if (!box) return
+  const u = currentUser()
+  const cfg = deliveryCfg()
+  box.innerHTML =
+    '<div class="field mt-8"><label>Recovery email</label><input type="email" id="recEmail" placeholder="you@example.com" value="' + esc((u && u.recoveryEmail) || '') + '" autocomplete="email"></div>' +
+    '<button class="btn btn-primary" id="recSendBtn" style="width:100%" type="button">Send verification code</button>' +
+    (cfg.email ? '' : '<div class="alert alert-error mt-12">Email delivery is not configured on the server yet, so the code cannot be delivered.</div>') +
+    '<div id="recMsg"></div>'
+  const emailInput = box.querySelector('#recEmail')
+  const go = async () => {
+    const email = (emailInput.value || '').trim().toLowerCase()
+    const msgEl = box.querySelector('#recMsg')
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { if (msgEl) msgEl.innerHTML = otpErrorHtml('Enter a valid email address'); return }
+    const btn = box.querySelector('#recSendBtn')
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Sending...' }
+    const res = await apiUser('/api/account/recovery-email/send', { email })
+    if (btn) { btn.disabled = false; btn.textContent = 'Send verification code' }
+    if (!res || res.status !== 'Real') { if (msgEl) msgEl.innerHTML = otpErrorHtml((res && res.error) || 'Could not send the code.'); return }
+    recState.email = email
+    recState.sent = res
+    recStepCode()
+  }
+  const btn = box.querySelector('#recSendBtn')
+  if (btn) btn.addEventListener('click', go)
+  if (emailInput) { emailInput.focus(); emailInput.addEventListener('keydown', e => { if (e.key === 'Enter') go() }) }
+}
+
+function recStepCode() {
+  const box = recState.box
+  if (!box) return
+  const sent = recState.sent || {}
+  box.innerHTML =
+    '<p class="muted small mt-8">Enter the 6-digit code sent to <b>' + esc(sent.contact || recState.email) + '</b>.</p>' +
+    devInboxHtml(sent) +
+    '<div class="field mt-8"><label>One-time code</label><input type="text" id="otpCode" inputmode="numeric" maxlength="6" placeholder="6-digit code" value="' + (sent.dev ? esc(sent.code) : '') + '" autocomplete="one-time-code"></div>' +
+    '<button class="btn btn-primary" id="otpVerifyBtn" style="width:100%" type="button">Verify & save</button>' +
+    '<div class="small muted center mt-12"><a href="#" data-rec-resend>Resend code</a></div>' +
+    '<div id="recMsg"></div>'
+  const codeInput = box.querySelector('#otpCode')
+  const verify = async () => {
+    const msgEl = box.querySelector('#recMsg')
+    const code = (codeInput.value || '').trim()
+    if (!/^\d{6}$/.test(code)) { if (msgEl) msgEl.innerHTML = otpErrorHtml('Enter the 6-digit code'); return }
+    const btn = box.querySelector('#otpVerifyBtn')
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Verifying...' }
+    const res = await apiUser('/api/account/recovery-email/verify', { email: recState.email, code })
+    if (btn) { btn.disabled = false; btn.textContent = 'Verify & save' }
+    if (!res || res.status !== 'Real') { if (msgEl) msgEl.innerHTML = otpErrorHtml((res && res.error) || 'Verification failed'); return }
+    const users = store.users()
+    const u = users.find(x => x.email === currentUser().email)
+    if (u) { u.recoveryEmail = recState.email; store.saveUsers(users) }
+    toast('Recovery email saved')
+    closeModal()
+    if (pathFromLocation() === '/dashboard') navigate()
+  }
+  const vBtn = box.querySelector('#otpVerifyBtn')
+  if (vBtn) vBtn.addEventListener('click', verify)
+  if (codeInput) codeInput.addEventListener('keydown', e => { if (e.key === 'Enter') verify() })
+  const resend = box.querySelector('[data-rec-resend]')
+  if (resend) resend.addEventListener('click', async e => {
+    e.preventDefault()
+    const res = await apiUser('/api/account/recovery-email/send', { email: recState.email })
+    if (res && res.status === 'Real') { recState.sent = res; recStepCode() }
+    else { const msgEl = box.querySelector('#recMsg'); if (msgEl) msgEl.innerHTML = otpErrorHtml((res && res.error) || 'Could not resend the code.') }
+  })
 }
 
 /* ============================================================== live chat */
@@ -3270,6 +3558,9 @@ function bindView(path, root) {
   if (fpLink) fpLink.addEventListener('click', (e) => { e.preventDefault(); openForgotFlow() })
   const verifyPhoneBtn = root.querySelector('[data-verify-phone]')
   if (verifyPhoneBtn) verifyPhoneBtn.addEventListener('click', openPhoneVerify)
+  const recEmailBtn = root.querySelector('[data-recovery-email]')
+  if (recEmailBtn) recEmailBtn.addEventListener('click', openRecoveryEmail)
+  if (path === '/dashboard') loadMyRecoveryEmail()
 
   if (path === '/admin') {
     const forgotLink = root.querySelector('[data-admin-forgot]')
@@ -3526,6 +3817,7 @@ function seedAdmin() {
 document.addEventListener('DOMContentLoaded', async () => {
   seedAdmin()
   bindGlobal()
+  await loadSiteConfig()
   try { await cloudBoot() } catch (e) { console.warn('Cloud boot skipped:', e && e.message) }
   navigate()
   renderChat()

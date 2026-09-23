@@ -40,6 +40,14 @@
     } catch (e) { return '' }
   }
 
+  async function accessToken() {
+    if (!client) return ''
+    try {
+      var s = await client.auth.getSession()
+      return (s && s.data && s.data.session && s.data.session.access_token) || ''
+    } catch (e) { return '' }
+  }
+
   async function signUp(name, email, password) {
     var r = await client.auth.signUp({ email: email, password: password })
     if (r.error) throw r.error
@@ -125,5 +133,5 @@
     return { id: c.client_ref || c.id, email: c.email, name: c.name, messages: c.messages || [], userUnread: c.user_unread, adminUnread: c.admin_unread, updatedAt: c.updated_at }
   }
 
-  window.SeoCloud = { enabled: enabled, init: init, sessionEmail: sessionEmail, signUp: signUp, signIn: signIn, signOut: signOut, pullAll: pullAll, upsert: upsert, remove: remove }
+  window.SeoCloud = { enabled: enabled, init: init, sessionEmail: sessionEmail, accessToken: accessToken, signUp: signUp, signIn: signIn, signOut: signOut, pullAll: pullAll, upsert: upsert, remove: remove }
 })();
