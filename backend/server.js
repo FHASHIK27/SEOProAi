@@ -1419,63 +1419,72 @@ async function sendRealOtp(channel, contact, code, purpose) {
     if (channel === 'email') {
       const subject = otpSubject(purpose)
       const text = otpMessage(purpose, code)
+      // Try every configured provider in order and stop at the first success,
+      // so one misconfigured provider never blocks a working one.
+      const attempts = []
       if (process.env.BREVO_API_KEY) {
-        const fromAddr = (process.env.EMAIL_FROM || '').match(/<([^>]+)>/)
-        const sender = fromAddr ? fromAddr[1] : (process.env.EMAIL_FROM || process.env.SMTP_USER || '').trim()
-        const senderName = (String(process.env.EMAIL_FROM || '').match(/^(.*)</) || [])[1] || 'SEO Service Provider'
-        const res = await fetchT('https://api.brevo.com/v3/smtp/email', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'api-key': process.env.BREVO_API_KEY },
-          body: JSON.stringify({
-            sender: { email: sender, name: senderName.trim() || 'SEO Service Provider' },
-            to: [{ email: contact }],
-            subject,
-            textContent: text
-          })
-        }, 15000)
-        if (!res.ok) {
+        try {
+          const fromAddr = (process.env.EMAIL_FROM || '').match(/<([^>]+)>/)
+          const sender = fromAddr ? fromAddr[1] : (process.env.EMAIL_FROM || process.env.SMTP_USER || '').trim()
+          const senderName = (String(process.env.EMAIL_FROM || '').match(/^(.*)</) || [])[1] || 'SEO Service Provider'
+          const res = await fetchT('https://api.brevo.com/v3/smtp/email', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'api-key': process.env.BREVO_API_KEY },
+            body: JSON.stringify({
+              sender: { email: sender, name: senderName.trim() || 'SEO Service Provider' },
+              to: [{ email: contact }],
+              subject,
+              textContent: text
+            })
+          }, 15000)
+          if (res.ok) return { ok: true, provider: 'Brevo' }
           const body = await res.text().catch(() => '')
-          return { ok: false, error: 'Email provider returned ' + res.status + (body ? ': ' + body.slice(0, 180) : '') }
-        }
-        return { ok: true }
+          attempts.push('Brevo ' + res.status + (body ? ': ' + body.slice(0, 140) : ''))
+        } catch (e) { attempts.push('Brevo: ' + ((e && e.message) || 'failed')) }
       }
       if (process.env.RESEND_API_KEY) {
-        const res = await fetchT('https://api.resend.com/emails', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + process.env.RESEND_API_KEY },
-          body: JSON.stringify({
-            from: process.env.EMAIL_FROM || 'noreply@seo-service-provider.com',
-            to: contact,
-            subject,
-            text
-          })
-        }, 15000)
-        if (!res.ok) {
+        try {
+          const res = await fetchT('https://api.resend.com/emails', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + process.env.RESEND_API_KEY },
+            body: JSON.stringify({
+              from: process.env.EMAIL_FROM || 'noreply@seo-service-provider.com',
+              to: contact,
+              subject,
+              text
+            })
+          }, 15000)
+          if (res.ok) return { ok: true, provider: 'Resend' }
           const body = await res.text().catch(() => '')
-          return { ok: false, error: 'Email provider returned ' + res.status + (body ? ': ' + body.slice(0, 180) : '') }
+          attempts.push('Resend ' + res.status + (body ? ': ' + body.slice(0, 140) : ''))
+        } catch (e) { attempts.push('Resend: ' + ((e && e.message) || 'failed')) }
+      }
+      if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+        const nodemailer = await import('nodemailer').catch(() => null)
+        if (!nodemailer) attempts.push('SMTP: mail library unavailable')
+        else {
+          try {
+            const t = nodemailer.createTransport({
+              host: process.env.SMTP_HOST,
+              port: Number(process.env.SMTP_PORT || 587),
+              secure: process.env.SMTP_SECURE === '1',
+              auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+            })
+            await t.sendMail({
+              from: process.env.EMAIL_FROM || process.env.SMTP_USER,
+              to: contact,
+              subject,
+              text
+            })
+            return { ok: true, provider: 'SMTP' }
+          } catch (e) {
+            const raw = (e && (e.response || e.message)) ? String(e.response || e.message) : 'SMTP rejected the message.'
+            attempts.push('SMTP: ' + raw.slice(0, 160))
+          }
         }
-        return { ok: true }
       }
-      const nodemailer = await import('nodemailer').catch(() => null)
-      if (!nodemailer) return { ok: false, error: 'Mail library unavailable on the server.' }
-      const t = nodemailer.createTransport({
-        host: process.env.SMTP_HOST,
-        port: Number(process.env.SMTP_PORT || 587),
-        secure: process.env.SMTP_SECURE === '1',
-        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-      })
-      try {
-        await t.sendMail({
-          from: process.env.EMAIL_FROM || process.env.SMTP_USER,
-          to: contact,
-          subject,
-          text
-        })
-        return { ok: true }
-      } catch (e) {
-        const raw = (e && (e.response || e.message)) ? String(e.response || e.message) : 'SMTP rejected the message.'
-        return { ok: false, error: raw.slice(0, 200) }
-      }
+      if (!attempts.length) return { ok: false, error: 'No email provider is configured.' }
+      return { ok: false, error: 'Email delivery failed. ' + attempts.join(' | ') }
     }
     if (channel === 'whatsapp') {
       const viaGateway = await sendWhatsAppGateway(contact, otpMessage(purpose, code))
