@@ -3205,7 +3205,7 @@ function openRegisterOtpFlow(name, email, pass) {
     sending: false, sent: null, reg: { name: String(name || '').trim(), email: emailKey, pass }
   }
   const box = otpModal('Verify your email',
-    'A one-time code is being sent to <b>' + esc(emailKey) + '</b>. Enter it to activate your new account. Codes expire in 5 minutes.', true)
+    'We will send a one-time code to <b>' + esc(emailKey) + '</b>. Enter it below to activate your new account. Codes expire in 5 minutes.', true)
   otpState.box = box
   otpSendAndStep()
 }
