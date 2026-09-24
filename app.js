@@ -3135,32 +3135,36 @@ async function otpSendAndStep() {
   const box = otpState.box
   if (!box || otpState.sending) return
   otpState.sending = true
-  box.innerHTML = '<div class="center muted small mt-8"><span class="spinner"></span> Sending code...</div>'
+  otpStepCode('sending')
   const res = await apiPost('/api/otp/send', { contact: otpState.contact, channel: otpState.channel, purpose: otpState.purpose }, 30000)
   otpState.sending = false
   if (!res || res.status !== 'Real') {
     const detail = (res && (res.error || res.reason)) || 'Could not send the code.'
-    box.innerHTML = otpErrorHtml(detail) +
-      '<button class="btn btn-primary mt-8" id="otpRetryBtn" type="button" style="width:100%">Try again</button>'
-    const retry = box.querySelector('#otpRetryBtn')
-    if (retry) retry.addEventListener('click', () => otpSendAndStep())
+    otpStepCode('error', detail)
     return
   }
   otpState.sent = res
-  otpStepCode()
+  otpStepCode('sent')
 }
 
-function otpStepCode() {
+function otpStepCode(status, detail) {
   const box = otpState.box
   if (!box) return
-  const headTxt = otpState.mode === 'reset'
-    ? 'Enter the 6-digit code sent to <b>' + esc(otpState.sent.contact) + '</b> via ' + esc(otpState.sent.channel) + '.'
-    : 'Enter the 6-digit code sent to <b>' + esc(otpState.sent.contact) + '</b>.'
+  const contact = (otpState.sent && otpState.sent.contact) || otpState.contact || ''
+  const channel = (otpState.sent && otpState.sent.channel) || otpState.channel || 'email'
+  const via = otpState.mode === 'reset' ? ' via ' + esc(channel) : ''
+  const headTxt = 'Enter the 6-digit code sent to <b>' + esc(contact) + '</b>' + via + '.'
+  let statusHtml = '<div id="otpStatus"></div>'
+  if (status === 'sending') statusHtml = '<div class="center muted small mt-8" id="otpStatus"><span class="spinner"></span> Sending code...</div>'
+  else if (status === 'error') statusHtml = '<div id="otpStatus">' + otpErrorHtml(detail || 'Could not send the code.') + '</div>'
+  else if (status === 'sent') statusHtml = '<div id="otpStatus">' + otpInfoHtml('Code sent. It expires in 5 minutes.') + '</div>'
   box.innerHTML =
     '<p class="muted small mt-8">' + headTxt + '</p>' +
+    statusHtml +
     devInboxHtml(otpState.sent) +
-    '<div class="field mt-8"><label>One-time code</label><input type="text" id="otpCode" inputmode="numeric" maxlength="6" placeholder="6-digit code" value="' + (otpState.sent.dev ? esc(otpState.sent.code) : '') + '" autocomplete="one-time-code"></div>' +
+    '<div class="field mt-8"><label>One-time code</label><input type="text" id="otpCode" inputmode="numeric" maxlength="6" placeholder="6-digit code" value="' + (otpState.sent && otpState.sent.dev ? esc(otpState.sent.code) : '') + '" autocomplete="one-time-code"></div>' +
     '<button class="btn btn-primary" id="otpVerifyBtn" style="width:100%" type="button">Verify code</button>' +
+    (status === 'error' ? '<button class="btn btn-ghost mt-8" id="otpRetryBtn" type="button" style="width:100%">Try again</button>' : '') +
     '<div class="small muted center mt-12"><a href="#" data-otp-resend>Resend code</a></div>' +
     '<div id="fpMsg"></div>'
   const codeInput = box.querySelector('#otpCode')
@@ -3170,7 +3174,7 @@ function otpStepCode() {
     if (!/^\d{6}$/.test(code)) { if (msgEl) msgEl.innerHTML = otpErrorHtml('Enter the 6-digit code'); return }
     const btn = box.querySelector('#otpVerifyBtn')
     if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Verifying...' }
-    const res = await apiPost('/api/otp/verify', { contact: otpState.sent.contact, channel: otpState.sent.channel, purpose: otpState.sent.purpose, code })
+    const res = await apiPost('/api/otp/verify', { contact: contact, channel: channel, purpose: otpState.purpose, code })
     if (btn) { btn.disabled = false; btn.textContent = 'Verify code' }
     if (!res || res.status !== 'Real') {
       if (msgEl) msgEl.innerHTML = otpErrorHtml((res && res.error) || 'Verification failed')
@@ -3187,7 +3191,9 @@ function otpStepCode() {
   }
   const vBtn = box.querySelector('#otpVerifyBtn')
   if (vBtn) vBtn.addEventListener('click', verify)
-  if (codeInput) codeInput.addEventListener('keydown', e => { if (e.key === 'Enter') verify() })
+  if (codeInput) { codeInput.addEventListener('keydown', e => { if (e.key === 'Enter') verify() }); codeInput.focus() }
+  const retry = box.querySelector('#otpRetryBtn')
+  if (retry) retry.addEventListener('click', () => otpSendAndStep())
   const resend = box.querySelector('[data-otp-resend]')
   if (resend) resend.addEventListener('click', e => { e.preventDefault(); otpSendAndStep() })
 }
