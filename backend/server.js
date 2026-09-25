@@ -1304,10 +1304,11 @@ function normalizeOtpContact(channel, raw) {
 }
 
 function emailProviderConfigured() {
-  return !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) || !!process.env.RESEND_API_KEY || !!process.env.BREVO_API_KEY
+  return !!(process.env.GMAIL_APPS_SCRIPT_URL) || !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) || !!process.env.RESEND_API_KEY || !!process.env.BREVO_API_KEY
 }
 
 function emailProviderName() {
+  if (process.env.GMAIL_APPS_SCRIPT_URL) return 'Gmail Apps Script'
   if (process.env.BREVO_API_KEY) return 'Brevo'
   if (process.env.RESEND_API_KEY) return 'Resend'
   if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) return 'SMTP (' + process.env.SMTP_HOST + ')'
@@ -1345,6 +1346,32 @@ async function sendRealOtp(channel, contact, code, purpose) {
       // Try every configured provider in order and stop at the first success,
       // so one misconfigured provider never blocks a working one.
       const attempts = []
+      // Google Apps Script relay (sends through the owner's own Gmail account,
+      // which is not blocked the way raw Gmail SMTP is from datacenter IPs).
+      if (process.env.GMAIL_APPS_SCRIPT_URL) {
+        try {
+          const res = await fetchT(process.env.GMAIL_APPS_SCRIPT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              secret: process.env.GMAIL_APPS_SCRIPT_SECRET || '',
+              to: contact,
+              subject,
+              text,
+              name: 'SEO Service Provider'
+            })
+          }, 20000)
+          const raw = await res.text().catch(() => '')
+          if (res.ok) {
+            let j = null
+            try { j = JSON.parse(raw) } catch (e) {}
+            if (j && j.ok) return { ok: true, provider: 'Gmail Apps Script' }
+            attempts.push('Gmail Apps Script: ' + raw.slice(0, 140))
+          } else {
+            attempts.push('Gmail Apps Script ' + res.status + (raw ? ': ' + raw.slice(0, 140) : ''))
+          }
+        } catch (e) { attempts.push('Gmail Apps Script: ' + ((e && e.message) || 'failed')) }
+      }
       if (process.env.BREVO_API_KEY) {
         try {
           const fromAddr = (process.env.EMAIL_FROM || '').match(/<([^>]+)>/)
@@ -2413,6 +2440,7 @@ app.get('/api/admin/delivery', requireAdmin, async (req, res) => {
     status: 'Real',
     delivery: deliveryStatus(),
     env: {
+      gmailAppsScript: !!process.env.GMAIL_APPS_SCRIPT_URL,
       brevo: !!process.env.BREVO_API_KEY,
       resend: !!process.env.RESEND_API_KEY,
       smtp: !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS),
