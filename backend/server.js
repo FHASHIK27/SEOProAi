@@ -1391,10 +1391,14 @@ async function sendRealOtp(channel, contact, code, purpose) {
               host: process.env.SMTP_HOST,
               port: Number(process.env.SMTP_PORT || 587),
               secure: process.env.SMTP_SECURE === '1',
-              auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+              auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+              connectionTimeout: 15000,
+              greetingTimeout: 15000,
+              socketTimeout: 20000
             })
+            const smtpFrom = process.env.SMTP_FROM || (process.env.SMTP_USER ? 'SEO Service Provider <' + process.env.SMTP_USER + '>' : process.env.EMAIL_FROM)
             await t.sendMail({
-              from: process.env.EMAIL_FROM || process.env.SMTP_USER,
+              from: smtpFrom,
               to: contact,
               subject,
               text
