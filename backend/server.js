@@ -1223,9 +1223,9 @@ function buildKeywords(primary, serp) {
 // ---------------------------------------------------------------- otp & password reset
 // One-time codes are stored only as SHA-256 hashes, expire, cap attempts,
 // enforce a resend cooldown and an hourly send cap per contact. OTP is
-// single-use and bound to a purpose (password reset / phone verify) and
-// contact. Real delivery adapters (email / sms / whatsapp) activate when the
-// matching provider credentials exist in backend/.env; otherwise the code is
+// single-use and bound to a purpose (password reset / email verify) and
+// contact. Real email delivery activates when the matching provider
+// credentials exist in backend/.env; otherwise the code is
 // returned as a clearly-labelled dev inbox so the flow stays testable here.
 
 const otpCodes = new Map()
@@ -1307,28 +1307,6 @@ function emailProviderConfigured() {
   return !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) || !!process.env.RESEND_API_KEY || !!process.env.BREVO_API_KEY
 }
 
-function phoneProviderConfigured() {
-  const twilio = !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN &&
-    (process.env.TWILIO_WHATSAPP_FROM || process.env.TWILIO_PHONE_FROM))
-  const meta = !!(process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN)
-  const gateway = !!(process.env.WHATSAPP_GATEWAY_URL ||
-    (process.env.ULTRAMSG_INSTANCE_ID && process.env.ULTRAMSG_TOKEN) ||
-    (process.env.CALLMEBOT_API_KEY && process.env.CALLMEBOT_PHONE))
-  return twilio || meta || gateway
-}
-
-function whatsappProviderConfigured() {
-  return !!(process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN) ||
-    !!(process.env.CALLMEBOT_API_KEY && process.env.CALLMEBOT_PHONE) ||
-    !!(process.env.ULTRAMSG_INSTANCE_ID && process.env.ULTRAMSG_TOKEN) ||
-    !!process.env.WHATSAPP_GATEWAY_URL ||
-    !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_WHATSAPP_FROM)
-}
-
-function smsProviderConfigured() {
-  return !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_PHONE_FROM)
-}
-
 function emailProviderName() {
   if (process.env.BREVO_API_KEY) return 'Brevo'
   if (process.env.RESEND_API_KEY) return 'Resend'
@@ -1336,23 +1314,10 @@ function emailProviderName() {
   return null
 }
 
-function phoneProviderName() {
-  if (process.env.CALLMEBOT_API_KEY && process.env.CALLMEBOT_PHONE) return 'CallMeBot (your own number)'
-  if (process.env.ULTRAMSG_INSTANCE_ID && process.env.ULTRAMSG_TOKEN) return 'Ultramsg'
-  if (process.env.WHATSAPP_GATEWAY_URL) return 'WhatsApp gateway'
-  if (process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN) return 'WhatsApp Cloud API'
-  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && (process.env.TWILIO_WHATSAPP_FROM || process.env.TWILIO_PHONE_FROM)) return 'Twilio'
-  return null
-}
-
 function deliveryStatus() {
   return {
     email: emailProviderConfigured(),
-    emailProvider: emailProviderName(),
-    phone: phoneProviderConfigured(),
-    phoneProvider: phoneProviderName(),
-    whatsapp: whatsappProviderConfigured(),
-    sms: smsProviderConfigured()
+    emailProvider: emailProviderName()
   }
 }
 
@@ -1370,48 +1335,6 @@ function otpMessage(purpose, code) {
     return 'Your SEOPro AI one-time code is ' + code + '. Use it to reset your password. It expires in 5 minutes. If you did not request this, ignore this email.'
   }
   return 'Your SEOPro AI one-time code is ' + code + '. It expires in 5 minutes.'
-}
-
-// Free / low-cost WhatsApp gateways. Returns null when none is configured so
-// the caller can fall through to Meta Cloud API / Twilio.
-// - CallMeBot: free, but only delivers to the number that owns the API key.
-// - Ultramsg: free trial instance, sends to any number.
-// - Generic gateway: any provider exposing a simple JSON/webhook send URL.
-async function sendWhatsAppGateway(contact, text) {
-  const to = String(contact).replace(/[^\d]/g, '')
-  if (process.env.CALLMEBOT_API_KEY && process.env.CALLMEBOT_PHONE) {
-    const url = 'https://api.callmebot.com/whatsapp.php?phone=' + encodeURIComponent(process.env.CALLMEBOT_PHONE) +
-      '&text=' + encodeURIComponent(text) + '&apikey=' + encodeURIComponent(process.env.CALLMEBOT_API_KEY)
-    const res = await fetchT(url, {}, 10000)
-    if (!res.ok) return { ok: false, error: 'CallMeBot returned ' + res.status }
-    return { ok: true, provider: 'CallMeBot' }
-  }
-  if (process.env.ULTRAMSG_INSTANCE_ID && process.env.ULTRAMSG_TOKEN) {
-    const res = await fetchT('https://api.ultramsg.com/' + process.env.ULTRAMSG_INSTANCE_ID + '/messages/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ token: process.env.ULTRAMSG_TOKEN, to: to, body: text }).toString()
-    }, 12000)
-    if (!res.ok) {
-      const body = await res.text().catch(() => '')
-      return { ok: false, error: 'WhatsApp gateway returned ' + res.status + (body ? ': ' + body.slice(0, 180) : '') }
-    }
-    return { ok: true, provider: 'Ultramsg' }
-  }
-  if (process.env.WHATSAPP_GATEWAY_URL) {
-    const headers = { 'Content-Type': 'application/json' }
-    if (process.env.WHATSAPP_GATEWAY_TOKEN) headers.Authorization = 'Bearer ' + process.env.WHATSAPP_GATEWAY_TOKEN
-    const res = await fetchT(process.env.WHATSAPP_GATEWAY_URL, {
-      method: 'POST', headers,
-      body: JSON.stringify({ to: to, message: text, token: process.env.WHATSAPP_GATEWAY_TOKEN || undefined })
-    }, 12000)
-    if (!res.ok) {
-      const body = await res.text().catch(() => '')
-      return { ok: false, error: 'WhatsApp gateway returned ' + res.status + (body ? ': ' + body.slice(0, 180) : '') }
-    }
-    return { ok: true, provider: 'WhatsApp gateway' }
-  }
-  return null
 }
 
 async function sendRealOtp(channel, contact, code, purpose) {
@@ -1486,49 +1409,7 @@ async function sendRealOtp(channel, contact, code, purpose) {
       if (!attempts.length) return { ok: false, error: 'No email provider is configured.' }
       return { ok: false, error: 'Email delivery failed. ' + attempts.join(' | ') }
     }
-    if (channel === 'whatsapp') {
-      const viaGateway = await sendWhatsAppGateway(contact, otpMessage(purpose, code))
-      if (viaGateway) return viaGateway
-    }
-    if (channel === 'whatsapp' && process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN) {
-      const to = contact.replace(/[^\d]/g, '')
-      const tpl = process.env.WHATSAPP_TEMPLATE_NAME
-      const payload = tpl
-        ? {
-            messaging_product: 'whatsapp', to, type: 'template',
-            template: { name: tpl, language: { code: process.env.WHATSAPP_TEMPLATE_LANG || 'en' }, components: [{ type: 'body', parameters: [{ type: 'text', text: code }] }] }
-          }
-        : { messaging_product: 'whatsapp', to, type: 'text', text: { body: otpMessage(purpose, code) } }
-      const res = await fetchT('https://graph.facebook.com/' + (process.env.WHATSAPP_API_VERSION || 'v21.0') + '/' + process.env.WHATSAPP_PHONE_NUMBER_ID + '/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + process.env.WHATSAPP_ACCESS_TOKEN },
-        body: JSON.stringify(payload)
-      }, 12000)
-      if (!res.ok) {
-        const body = await res.text().catch(() => '')
-        return { ok: false, error: 'WhatsApp provider returned ' + res.status + (body ? ': ' + body.slice(0, 180) : '') }
-      }
-      return { ok: true }
-    }
-    if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-      const sid = process.env.TWILIO_ACCOUNT_SID
-      const token = process.env.TWILIO_AUTH_TOKEN
-      const from = channel === 'whatsapp' ? (process.env.TWILIO_WHATSAPP_FROM || process.env.TWILIO_PHONE_FROM) : process.env.TWILIO_PHONE_FROM
-      const to = channel === 'whatsapp' ? 'whatsapp:' + contact : contact
-      const dest = channel === 'whatsapp' ? from && from.startsWith('whatsapp:') ? from : 'whatsapp:' + (from || '') : from
-      if (!to || !dest || dest === 'whatsapp:') return { ok: false, error: 'Phone sender is not configured.' }
-      const res = await fetchT('https://api.twilio.com/2010-04-01/Accounts/' + sid + '/Messages.json', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: 'Basic ' + Buffer.from(sid + ':' + token).toString('base64') },
-        body: new URLSearchParams({ To: to, From: dest, Body: otpMessage(purpose, code) }).toString()
-      }, 12000)
-      if (!res.ok) {
-        const body = await res.text().catch(() => '')
-        return { ok: false, error: 'SMS provider returned ' + res.status + (body ? ': ' + body.slice(0, 180) : '') }
-      }
-      return { ok: true }
-    }
-    return { ok: false, error: 'No phone provider is configured.' }
+    return { ok: false, error: 'Unsupported OTP channel.' }
   } catch (e) {
     return { ok: false, error: (e && e.message) ? String(e.message).slice(0, 200) : 'Delivery failed.' }
   }
@@ -1536,17 +1417,10 @@ async function sendRealOtp(channel, contact, code, purpose) {
 
 async function deliverOtp(channel, contact, code, purpose, allowDev) {
   if (allowDev) return { ok: true, dev: true }
-  const hasProvider = channel === 'email'
-    ? emailProviderConfigured()
-    : (channel === 'whatsapp' ? whatsappProviderConfigured() : smsProviderConfigured())
-  if (!hasProvider) {
+  if (!emailProviderConfigured()) {
     return {
       ok: false,
-      reason: channel === 'email'
-        ? 'Email delivery is not configured on the server (set BREVO_API_KEY, or RESEND_API_KEY, or SMTP_HOST/SMTP_USER/SMTP_PASS).'
-        : (channel === 'whatsapp'
-          ? 'WhatsApp delivery is not configured (set CALLMEBOT_API_KEY/CALLMEBOT_PHONE, ULTRAMSG_INSTANCE_ID/ULTRAMSG_TOKEN, WHATSAPP_GATEWAY_URL, WHATSAPP_PHONE_NUMBER_ID/WHATSAPP_ACCESS_TOKEN, or Twilio).'
-          : 'SMS delivery is not configured (set Twilio TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_PHONE_FROM).')
+      reason: 'Email delivery is not configured on the server (set BREVO_API_KEY, or RESEND_API_KEY, or SMTP_HOST/SMTP_USER/SMTP_PASS).'
     }
   }
   return await sendRealOtp(channel, contact, code, purpose)
@@ -1593,19 +1467,15 @@ async function consumeOtp(channel, contact, purpose, code) {
 
 app.post('/api/otp/send', otpLimit, async (req, res) => {
   const { contact, channel = 'email', purpose = 'reset' } = req.body
-  const VALID_PURPOSES = ['reset', 'verify_phone', 'verify_email']
-  if (['email', 'sms', 'whatsapp'].indexOf(channel) < 0) {
-    return res.status(400).json({ status: 'Error', error: 'channel must be email, sms or whatsapp', compliance })
+  const VALID_PURPOSES = ['reset', 'verify_email']
+  if (channel !== 'email') {
+    return res.status(400).json({ status: 'Error', error: 'channel must be email', compliance })
   }
   if (VALID_PURPOSES.indexOf(purpose) < 0) {
-    return res.status(400).json({ status: 'Error', error: 'purpose must be reset, verify_phone or verify_email', compliance })
+    return res.status(400).json({ status: 'Error', error: 'purpose must be reset or verify_email', compliance })
   }
-  const contactNorm = normalizeOtpContact(channel, contact)
-  if (channel === 'email') {
-    if (!EMAIL_RE.test(contactNorm)) return res.status(400).json({ status: 'Error', error: 'Enter a valid email address', compliance })
-  } else if (!contactNorm) {
-    return res.status(400).json({ status: 'Error', error: 'Enter a valid mobile number (7-15 digits)', compliance })
-  }
+  const contactNorm = normalizeOtpContact('email', contact)
+  if (!EMAIL_RE.test(contactNorm)) return res.status(400).json({ status: 'Error', error: 'Enter a valid email address', compliance })
   const allowDev = DEV_ROUTES_ENABLED && req.query.dev === '1'
   const issued = await issueOtp(channel, contactNorm, purpose, allowDev)
   if (!issued.ok) {
@@ -1884,7 +1754,7 @@ function devHandoffBrief(files, endpoints, gmailConfigured) {
     'Backend REST endpoints:',
     endLines,
     '',
-    'Accounts/auth: demo localStorage DB on the client (no server user DB). Admin gate email: admin@seo-service-provider.com. Password reset + signup + phone verify use OTP endpoints.',
+    'Accounts/auth: demo localStorage DB on the client (no server user DB). Admin gate email: admin@seo-service-provider.com. Password reset + signup use email OTP endpoints.',
     'OTP delivery: email SMTP configured (Gmail). Real sending needs a Google App Password in SMTP_PASS - until then codes show in a labelled "Demo inbox".',
     'Server-side .env keys (names only, values never in code): SERPAPI_API_KEY, PAGESPEED_API_KEY, GEMINI_API_KEY(model ' + (process.env.GEMINI_MODEL || 'default') + '), SMTP_*.',
     'Dev console APIs (/api/dev/*) are owner-gated: they require header x-dev-key = DEV_KEY from backend/.env.',
@@ -2096,8 +1966,7 @@ app.get('/api/admin/verify', (req, res) => {
   res.json({ status: 'Real', email: data.email, role: data.role, permissions: data.permissions || null, expiresAt: data.exp })
 })
 
-// ---------------------------------------------------------------- admin account (password / recovery / phone)
-const PHONE_PURPOSES = ['admin_phone']
+// ---------------------------------------------------------------- admin account (password / recovery)
 const ADMIN_RESET_PURPOSE = 'admin_reset'
 
 app.get('/api/admin/account', requireAdmin, async (req, res) => {
@@ -2107,12 +1976,9 @@ app.get('/api/admin/account', requireAdmin, async (req, res) => {
       status: 'Real',
       email: req.adminEmail,
       recoveryEmail: acct.recoveryEmail || '',
-      phone: acct.phone ? maskContact('sms', acct.phone) : '',
-      phoneVerified: !!acct.phoneVerified,
       passwordSet: !!acct.hash,
       storageReady: supabaseReady(),
       emailProvider: emailProviderConfigured(),
-      phoneProvider: phoneProviderConfigured(),
       compliance
     })
   } catch (e) {
@@ -2152,72 +2018,33 @@ app.post('/api/admin/account/recovery', requireAdmin, async (req, res) => {
   }
 })
 
-app.post('/api/admin/account/phone', otpLimit, requireAdmin, async (req, res) => {
-  const channel = String((req.body && req.body.channel) || 'whatsapp').toLowerCase()
-  if (['whatsapp', 'sms'].indexOf(channel) < 0) return res.status(400).json({ status: 'Error', error: 'channel must be whatsapp or sms', compliance })
-  const phone = normalizeOtpContact('sms', (req.body && req.body.phone) || '')
-  if (!phone) return res.status(400).json({ status: 'Error', error: 'Enter a valid mobile number (7-15 digits).', compliance })
-  if (!supabaseReady()) return res.status(503).json({ status: 'Error', error: 'Server storage is not configured.', compliance })
-  const allowDev = DEV_ROUTES_ENABLED && req.query.dev === '1'
-  const issued = await issueOtp(channel, phone, PHONE_PURPOSES[0], allowDev)
-  if (!issued.ok) {
-    const rate = /wait|too many/i.test(issued.error || '')
-    return res.status(rate ? 429 : 502).json({ status: 'Error', error: issued.error, compliance })
-  }
-  try { await saveAdminAccount(req.adminEmail, { pendingPhone: phone }) } catch (e) {}
-  const out = { status: 'Real', channel, contact: maskContact('sms', phone), delivery: issued.dev ? 'dev-inbox' : 'sent', compliance }
-  if (issued.dev) { out.dev = true; out.code = issued.code }
-  res.json(out)
-})
-
-app.post('/api/admin/account/phone/verify', authLimit, requireAdmin, async (req, res) => {
-  const code = String((req.body && req.body.code) || '').trim()
-  const acct = await loadAdminAccount(req.adminEmail)
-  const phone = acct && acct.pendingPhone
-  if (!phone) return res.status(400).json({ status: 'Error', error: 'Request a code to your number first.', compliance })
-  const v = await consumeOtp('whatsapp', phone, PHONE_PURPOSES[0], code)
-  if (!v.ok) return res.status(400).json({ status: 'Error', error: v.error, compliance })
-  try {
-    await saveAdminAccount(req.adminEmail, { phone, phoneVerified: true, pendingPhone: null })
-    auditLog(req.adminEmail, 'recovery_phone_verified', maskContact('sms', phone), null, clientIp(req))
-    res.json({ status: 'Real', phoneVerified: true, phone: maskContact('sms', phone), compliance })
-  } catch (e) {
-    res.status(500).json({ status: 'Error', error: 'Verified but could not save the number.', compliance })
-  }
-})
-
 // Admin password recovery (works from the admin login screen, before a session exists).
 app.post('/api/admin/account/forgot', otpLimit, async (req, res) => {
   const email = String((req.body && req.body.email) || '').toLowerCase().trim()
-  const channel = String((req.body && req.body.channel) || 'email').toLowerCase()
   if (!ADMIN_EMAILS.includes(email)) {
     return res.json({ status: 'Real', sent: false, notice: 'If that admin account exists, a code has been sent.', compliance })
   }
   if (!supabaseReady()) return res.status(503).json({ status: 'Error', error: 'Server storage is not configured.', compliance })
   const acct = await loadAdminAccount(email)
-  const contact = channel === 'email' ? ((acct && acct.recoveryEmail) || email) : (acct && acct.phone)
-  if (!contact) return res.status(400).json({ status: 'Error', error: 'No ' + (channel === 'email' ? 'recovery email' : 'verified phone') + ' is saved for this admin account.', compliance })
-  if (channel !== 'email' && !(acct && acct.phoneVerified)) return res.status(400).json({ status: 'Error', error: 'The saved phone number is not verified yet.', compliance })
+  const contact = (acct && acct.recoveryEmail) || email
   const allowDev = DEV_ROUTES_ENABLED && req.query.dev === '1'
-  const issued = await issueOtp(channel === 'email' ? 'email' : channel, contact, ADMIN_RESET_PURPOSE, allowDev)
+  const issued = await issueOtp('email', contact, ADMIN_RESET_PURPOSE, allowDev)
   if (!issued.ok) {
     const rate = /wait|too many/i.test(issued.error || '')
     return res.status(rate ? 429 : 502).json({ status: 'Error', error: issued.error, compliance })
   }
-  const out = { status: 'Real', channel, contact: maskContact(channel, contact), delivery: issued.dev ? 'dev-inbox' : 'sent', compliance }
+  const out = { status: 'Real', channel: 'email', contact: maskContact('email', contact), delivery: issued.dev ? 'dev-inbox' : 'sent', compliance }
   if (issued.dev) { out.dev = true; out.code = issued.code }
   res.json(out)
 })
 
 app.post('/api/admin/account/forgot/verify', authLimit, async (req, res) => {
   const email = String((req.body && req.body.email) || '').toLowerCase().trim()
-  const channel = String((req.body && req.body.channel) || 'email').toLowerCase()
   const code = String((req.body && req.body.code) || '').trim()
   if (!ADMIN_EMAILS.includes(email)) return res.status(401).json({ status: 'Error', error: 'Invalid or expired code.', compliance })
   const acct = await loadAdminAccount(email)
-  const contact = channel === 'email' ? ((acct && acct.recoveryEmail) || email) : (acct && acct.phone)
-  if (!contact) return res.status(400).json({ status: 'Error', error: 'No recovery contact saved.', compliance })
-  const v = await consumeOtp(channel, contact, ADMIN_RESET_PURPOSE, code)
+  const contact = (acct && acct.recoveryEmail) || email
+  const v = await consumeOtp('email', contact, ADMIN_RESET_PURPOSE, code)
   if (!v.ok) return res.status(400).json({ status: 'Error', error: v.error, compliance })
   const token = crypto.randomBytes(32).toString('hex')
   await resetPut(token, { purpose: ADMIN_RESET_PURPOSE, contact, exp: Date.now() + RESET_TOKEN_TTL_MS, used: false })
@@ -2575,7 +2402,7 @@ app.post('/api/admin/users', requireAdmin, requireRole('admin'), async (req, res
   }
 })
 
-// Delivery diagnostics + test send (admin only). Makes the real email/WhatsApp
+// Delivery diagnostics + test send (admin only). Makes the real email
 // configuration visible so failures are obvious instead of silent.
 app.get('/api/admin/delivery', requireAdmin, async (req, res) => {
   res.json({
@@ -2585,8 +2412,6 @@ app.get('/api/admin/delivery', requireAdmin, async (req, res) => {
       brevo: !!process.env.BREVO_API_KEY,
       resend: !!process.env.RESEND_API_KEY,
       smtp: !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS),
-      twilio: !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN),
-      whatsappCloud: !!(process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN),
       emailFrom: process.env.EMAIL_FROM || null
     },
     compliance
@@ -2594,17 +2419,15 @@ app.get('/api/admin/delivery', requireAdmin, async (req, res) => {
 })
 
 app.post('/api/admin/delivery/test', requireAdmin, requireRole('admin'), async (req, res) => {
-  const channel = String((req.body && req.body.channel) || 'email').toLowerCase()
-  if (['email', 'sms', 'whatsapp'].indexOf(channel) < 0) return res.status(400).json({ status: 'Error', error: 'channel must be email, sms or whatsapp', compliance })
-  const norm = normalizeOtpContact(channel, (req.body && req.body.contact) || '')
-  if (!norm) return res.status(400).json({ status: 'Error', error: 'Enter a valid contact for ' + channel + '.', compliance })
-  if (!emailProviderConfigured() && !phoneProviderConfigured()) {
-    return res.status(503).json({ status: 'Error', error: 'No delivery provider is configured yet. Add BREVO_API_KEY (or Resend/SMTP) for email, or Twilio / WhatsApp Cloud API for phone.', compliance })
+  const norm = normalizeOtpContact('email', (req.body && req.body.contact) || '')
+  if (!EMAIL_RE.test(norm)) return res.status(400).json({ status: 'Error', error: 'Enter a valid email address.', compliance })
+  if (!emailProviderConfigured()) {
+    return res.status(503).json({ status: 'Error', error: 'No email provider is configured yet. Add BREVO_API_KEY (or Resend/SMTP).', compliance })
   }
-  const sent = await sendRealOtp(channel, norm, '123456', 'test')
-  auditLog(req.adminEmail, 'delivery_test', channel + ':' + maskContact(channel, norm), { ok: sent.ok }, clientIp(req))
+  const sent = await sendRealOtp('email', norm, '123456', 'test')
+  auditLog(req.adminEmail, 'delivery_test', 'email:' + maskContact('email', norm), { ok: sent.ok }, clientIp(req))
   if (!sent.ok) return res.status(502).json({ status: 'Error', error: sent.error || 'Delivery failed.', compliance })
-  res.json({ status: 'Real', sent: true, channel, to: maskContact(channel, norm), compliance })
+  res.json({ status: 'Real', sent: true, channel: 'email', to: maskContact('email', norm), compliance })
 })
 
 // ---------------------------------------------------------------- crypto verify

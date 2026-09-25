@@ -297,13 +297,6 @@ async function verifyPassword(user, password) {
   if (typeof user.password === 'string') return user.password === password
   return false
 }
-function maskPhone(p) {
-  const d = String(p || '').replace(/\D/g, '')
-  if (d.length < 4) return p || ''
-  const lead = /^\+/.test(String(p)) ? '+' : ''
-  return lead + d.slice(0, d.length - 4).replace(/./g, '*') + d.slice(-4)
-}
-function phoneDigits(p) { return String(p || '').replace(/[^\d+]/g, '') }
 
 function findUser(email) { return store.users().find(u => u.email === String(email || '').toLowerCase()) || null }
 function activeUsers() { return store.users().filter(u => !u.deleted) }
@@ -411,7 +404,7 @@ async function loadSiteConfig() {
 
 function deliveryCfg() {
   const d = window.__siteConfig && window.__siteConfig.delivery
-  return d || { email: false, emailProvider: null, phone: false, phoneProvider: null, whatsapp: false, sms: false }
+  return d || { email: false, emailProvider: null }
 }
 
 async function apiUser(path, body) {
@@ -1517,10 +1510,6 @@ function dashboardView() {
     ? '<div class="premium-badge premium-active mt-16">Premium Active - ' + esc(premium.planName) + '</div>'
     : '<button class="btn btn-primary btn-sm mt-16" data-plan="starter" type="button">Upgrade - Starter $5</button>'
 
-  const phoneLine = u.phoneVerified && u.phone
-    ? '<div class="phone-line"><b>' + esc(maskPhone(u.phone)) + '</b> <span class="label-pill label-good">VERIFIED</span></div>'
-    : '<div class="phone-line muted small">' + (u.phone ? esc(maskPhone(u.phone)) + ' - not verified yet' : 'No mobile number linked yet') + '</div>'
-
   const ownerBlock = isAdmin(u.email)
     ? '<div class="phone-block mt-16"><div class="p-label small muted">Owner console</div>' +
       '<div class="flex mt-8" style="gap:8px;flex-wrap:wrap">' +
@@ -1537,8 +1526,6 @@ function dashboardView() {
         '<h3>' + esc(u.name) + '</h3><div class="p-email">' + esc(u.email) + '</div>' +
         premiumBlock +
         ownerBlock +
-        '<div class="phone-block mt-16"><div class="p-label small muted">Mobile number (for password recovery)</div>' + phoneLine +
-        '<button class="btn btn-ghost btn-sm mt-8" data-verify-phone type="button">' + (u.phoneVerified ? 'Change / re-verify number' : 'Add & verify number') + '</button></div>' +
         '<div class="phone-block mt-16"><div class="p-label small muted">Recovery email (for password reset)</div>' +
         (u.recoveryEmail
           ? '<div class="phone-line"><b>' + esc(u.recoveryEmail) + '</b> <span class="label-pill label-good">SET</span></div>'
@@ -1809,7 +1796,7 @@ function adminTabContent() {
   }
   if (state.adminTab === 'account') {
     return '<h3>Account &amp; Security</h3>' +
-      '<p class="small muted mt-8">Change the admin password, add a recovery email, and verify a mobile number for WhatsApp/SMS password recovery.</p>' +
+      '<p class="small muted mt-8">Change the admin password and add a recovery email for password recovery.</p>' +
       '<div id="adminAcctStatus" class="alert alert-info mt-16">Loading account status...</div>' +
       '<div class="grid grid-2 mt-16" style="gap:16px">' +
         '<div class="form-card"><h4>Change password</h4>' +
@@ -1824,22 +1811,13 @@ function adminTabContent() {
           '<div class="field"><label>Recovery email</label><input type="email" id="acctRecovery" placeholder="you@example.com"></div>' +
           '<button class="btn btn-primary" id="acctRecoveryBtn" type="button">Save recovery email</button>' +
           '<div id="acctRecoveryMsg" class="mt-8"></div>' +
-          '<h4 class="mt-24">Mobile number (WhatsApp / SMS)</h4>' +
-          '<p class="small muted">Verify a number to reset your password by WhatsApp or SMS.</p>' +
-          '<div class="field"><label>Mobile number (with country code)</label><input type="tel" id="acctPhone" placeholder="+8801XXXXXXXXX"></div>' +
-          '<div class="input-row"><button class="btn btn-ghost" id="acctPhoneSendWa" type="button">Send code via WhatsApp</button>' +
-          '<button class="btn btn-ghost" id="acctPhoneSendSms" type="button">Send code via SMS</button></div>' +
-          '<div class="field mt-8"><label>One-time code</label><input type="text" id="acctPhoneCode" inputmode="numeric" maxlength="6" placeholder="6-digit code"></div>' +
-          '<button class="btn btn-primary" id="acctPhoneVerifyBtn" type="button">Verify number</button>' +
-          '<div id="acctPhoneMsg" class="mt-8"></div>' +
         '</div>' +
       '</div>' +
-      '<div class="form-card mt-16"><h4>Delivery providers (email / WhatsApp)</h4>' +
+      '<div class="form-card mt-16"><h4>Email delivery</h4>' +
         '<p class="small muted">Real delivery status. Test-send a code to confirm messages actually arrive.</p>' +
         '<div id="deliveryStatus" class="small mt-8">Loading...</div>' +
-        '<div class="grid grid-3 mt-16" style="gap:12px">' +
-          '<div class="field"><label>Channel</label><select id="dvChannel"><option value="email">Email</option><option value="whatsapp">WhatsApp</option><option value="sms">SMS</option></select></div>' +
-          aField('Send test to', 'dvContact', 'text', 'you@example.com or +8801...') +
+        '<div class="grid grid-2 mt-16" style="gap:12px">' +
+          aField('Send test to', 'dvContact', 'text', 'you@example.com') +
         '</div>' +
         '<button class="btn btn-primary" id="dvTestBtn" type="button">Send test message</button>' +
         '<div id="dvMsg" class="mt-8"></div>' +
@@ -1881,9 +1859,7 @@ async function adminAccountLoad() {
     statusEl.innerHTML =
       'Signed in as <b>' + esc(res.email) + '</b> - storage: ' +
       (res.storageReady ? '<span class="label-pill label-good">ready</span>' : '<span class="label-pill label-veryhigh">not configured</span>') +
-      ' - email delivery: ' + (res.emailProvider ? '<span class="label-pill label-good">configured</span>' : '<span class="label-pill label-veryhigh">missing</span>') +
-      ' - WhatsApp/SMS: ' + (res.phoneProvider ? '<span class="label-pill label-good">configured</span>' : '<span class="label-pill label-veryhigh">missing</span>') +
-      (res.phoneVerified ? ' - phone <b>' + esc(res.phone) + '</b> <span class="label-pill label-good">verified</span>' : '')
+      ' - email delivery: ' + (res.emailProvider ? '<span class="label-pill label-good">configured</span>' : '<span class="label-pill label-veryhigh">missing</span>')
   }
   if (recoveryEl && res.recoveryEmail) recoveryEl.value = res.recoveryEmail
 }
@@ -1912,35 +1888,15 @@ function bindAdminAccount() {
     acctMsg('acctRecoveryMsg', (res && (res.notice || res.error)) || 'Could not save the recovery email.', !!(res && res.saved))
   })
 
-  const sendPhone = async (channel) => {
-    const phone = ((document.getElementById('acctPhone') || {}).value || '').trim()
-    const res = await apiAdmin('/api/admin/account/phone', { phone, channel })
-    if (res && res.dev && res.code) { const el = document.getElementById('acctPhoneCode'); if (el) el.value = res.code }
-    acctMsg('acctPhoneMsg', (res && (res.error || ('Code sent to ' + (res.contact || phone) + (res.dev ? ' (development preview).' : '.')))) || 'Could not send the code.', !!(res && res.status === 'Real'))
-  }
-  const wa = document.getElementById('acctPhoneSendWa'); if (wa) wa.addEventListener('click', () => sendPhone('whatsapp'))
-  const sms = document.getElementById('acctPhoneSendSms'); if (sms) sms.addEventListener('click', () => sendPhone('sms'))
-
-  const vBtn = document.getElementById('acctPhoneVerifyBtn')
-  if (vBtn) vBtn.addEventListener('click', async () => {
-    const code = ((document.getElementById('acctPhoneCode') || {}).value || '').trim()
-    vBtn.disabled = true
-    const res = await apiAdmin('/api/admin/account/phone/verify', { code })
-    vBtn.disabled = false
-    acctMsg('acctPhoneMsg', (res && (res.error || (res.phoneVerified ? 'Number verified: ' + res.phone : ''))) || 'Verification failed.', !!(res && res.phoneVerified))
-    if (res && res.phoneVerified) adminAccountLoad()
-  })
-
   loadDeliveryStatus()
   const dvBtn = document.getElementById('dvTestBtn')
   if (dvBtn) dvBtn.addEventListener('click', async () => {
-    const channel = ((document.getElementById('dvChannel') || {}).value || 'email')
     const contact = ((document.getElementById('dvContact') || {}).value || '').trim()
     if (!contact) { aMsg('dvMsg', 'Enter a recipient for the test message.', false); return }
     dvBtn.disabled = true
-    const res = await apiAdmin('/api/admin/delivery/test', { channel, contact })
+    const res = await apiAdmin('/api/admin/delivery/test', { channel: 'email', contact })
     dvBtn.disabled = false
-    aMsg('dvMsg', (res && (res.error || ('Test message sent to ' + (res.to || contact) + ' via ' + channel + '.'))) || 'Could not send the test message.', !!(res && res.sent))
+    aMsg('dvMsg', (res && (res.error || ('Test message sent to ' + (res.to || contact) + '.'))) || 'Could not send the test message.', !!(res && res.sent))
   })
 
   adminAccountLoad()
@@ -1954,9 +1910,7 @@ async function loadDeliveryStatus() {
   const d = res.delivery || {}
   const pill = ok => ok ? '<span class="label-pill label-good">configured</span>' : '<span class="label-pill label-veryhigh">missing</span>'
   el.innerHTML =
-    '<div>Email: ' + pill(d.email) + ' ' + esc(d.emailProvider || 'not configured') + '</div>' +
-    '<div>WhatsApp: ' + pill(d.whatsapp) + ' ' + esc(d.phoneProvider || 'not configured') + '</div>' +
-    '<div>SMS: ' + pill(d.sms) + '</div>'
+    '<div>Email: ' + pill(d.email) + ' ' + esc(d.emailProvider || 'not configured') + '</div>'
 }
 
 /* ---------- admin: plans / payment methods / moderators / logs / settings ---------- */
@@ -2304,11 +2258,9 @@ function bindAdminChats() {
 
 function openAdminForgot() {
   const email = ((document.getElementById('adminEmail') || {}).value || 'admin@seo-service-provider.com').trim().toLowerCase()
-  openModal('<h3>Reset admin password</h3><p class="m-sub">Choose where to receive the one-time code.</p>' +
+  openModal('<h3>Reset admin password</h3><p class="m-sub">We will email a one-time code to your recovery email.</p>' +
     '<div class="otp-channels">' +
-      '<button class="btn btn-ghost" data-admin-forgot-ch="email" type="button">Email me a code<br><span class="small muted">recovery email</span></button>' +
-      '<button class="btn btn-ghost" data-admin-forgot-ch="whatsapp" type="button">WhatsApp a code<br><span class="small muted">verified number</span></button>' +
-      '<button class="btn btn-ghost" data-admin-forgot-ch="sms" type="button">SMS a code<br><span class="small muted">verified number</span></button>' +
+      '<button class="btn btn-primary" data-admin-forgot-ch="email" type="button">Email me a code<br><span class="small muted">recovery email</span></button>' +
     '</div><div id="adminForgotMsg" class="mt-8"></div>' +
     '<div class="modal-actions"><button class="btn btn-ghost" data-close-modal type="button">Cancel</button></div>')
   const msg = (m, ok) => { const el = document.getElementById('adminForgotMsg'); if (el) el.innerHTML = '<div class="alert ' + (ok ? 'alert-info' : 'alert-error') + '">' + esc(m) + '</div>' }
@@ -3096,36 +3048,15 @@ function fpStepChannel() {
   const box = otpState.box
   if (!box) return
   const target = otpState.targetUser
-  const cfg = deliveryCfg()
-  const hasPhone = target.phoneVerified && target.phone
-  const phoneButtons = (hasPhone && (cfg.whatsapp || cfg.sms))
-    ? (cfg.whatsapp ? '<button class="btn btn-ghost" data-otp-channel="whatsapp" type="button">WhatsApp a code<br><span class="small muted">' + esc(maskPhone(target.phone)) + '</span></button>' : '') +
-      (cfg.sms ? '<button class="btn btn-ghost" data-otp-channel="sms" type="button">SMS a code<br><span class="small muted">' + esc(maskPhone(target.phone)) + '</span></button>' : '')
-    : ''
   box.innerHTML =
-    '<p class="muted small mt-8">How do you want to receive the reset code for <b>' + esc(target.email) + '</b>?</p>' +
+    '<p class="muted small mt-8">We will email a reset code to <b>' + esc(target.email) + '</b>.</p>' +
     '<div class="otp-channels">' +
-      '<button class="btn btn-ghost" data-otp-channel="email" type="button">Email me a code<br><span class="small muted">' + esc(target.email) + '</span></button>' +
-      phoneButtons +
-      (hasPhone ? '' : '<div class="small muted otp-nophone">No verified mobile number yet - <a href="#" data-fp-nophone>add & verify one first</a> (you will need your current password).</div>') +
+      '<button class="btn btn-primary" data-otp-channel="email" type="button">Email me a code<br><span class="small muted">' + esc(target.email) + '</span></button>' +
     '</div>' +
-    (phoneButtons ? '' : '<div class="small muted mt-8">WhatsApp / SMS recovery is not switched on yet, so email is the active channel.</div>') +
     '<div id="fpMsg"></div>'
-  if (!hasPhone) {
-    const addLink = box.querySelector('[data-fp-nophone]')
-    if (addLink) addLink.addEventListener('click', e => {
-      e.preventDefault()
-      closeModal()
-      const logged = currentUser()
-      if (logged) openPhoneVerify()
-      else toast('Login first to add a mobile number to your account', 'error')
-    })
-  }
   box.querySelectorAll('[data-otp-channel]').forEach(b => b.addEventListener('click', () => {
-    const channel = b.getAttribute('data-otp-channel')
-    const contact = channel === 'email' ? target.email : target.phone
-    otpState.channel = channel
-    otpState.contact = contact
+    otpState.channel = 'email'
+    otpState.contact = target.email
     otpState.purpose = 'reset'
     otpSendAndStep()
   }))
@@ -3186,7 +3117,8 @@ function otpStepCode(status, detail) {
       otpState.resetToken = res.resetToken
       fpStepNewPassword()
     } else {
-      otpVerifiedSave()
+      closeModal()
+      toast('Verified successfully')
     }
   }
   const vBtn = box.querySelector('#otpVerifyBtn')
@@ -3264,59 +3196,6 @@ function fpStepNewPassword() {
   if (btn) btn.addEventListener('click', submit)
   if (p1) p1.addEventListener('keydown', e => { if (e.key === 'Enter') submit() })
   if (p2) p2.addEventListener('keydown', e => { if (e.key === 'Enter') submit() })
-}
-
-/* ---------- phone add & verify (logged in) ---------- */
-
-function openPhoneVerify() {
-  const u = currentUser()
-  if (!u) { toast('Please login first', 'error'); go('/auth'); return }
-  otpState = { mode: 'phone', purpose: 'verify_phone', channel: null, contact: null, sent: null, sending: false, targetUser: u }
-  const box = otpModal('Verify your mobile number', 'Add a mobile number and prove you own it. Once verified it can be used to reset your password via SMS or WhatsApp.')
-  otpState.box = box
-  phoneStepNumber()
-}
-
-function phoneStepNumber() {
-  const box = otpState.box
-  if (!box) return
-  const existing = otpState.targetUser.phone || ''
-  const cfg = deliveryCfg()
-  const buttons =
-    (cfg.whatsapp ? '<button class="btn btn-ghost" data-pv-channel="whatsapp" type="button">Send code via WhatsApp</button>' : '') +
-    (cfg.sms ? '<button class="btn btn-ghost" data-pv-channel="sms" type="button">Send code via SMS</button>' : '')
-  box.innerHTML =
-    '<div class="field mt-8"><label>Mobile number (with country code)</label><input type="tel" id="pvPhone" placeholder="+8801XXXXXXXXX" value="' + esc(existing) + '" autocomplete="tel"></div>' +
-    (buttons
-      ? '<div class="otp-channels">' + buttons + '</div>'
-      : '<div class="alert alert-error">WhatsApp and SMS delivery are not switched on yet, so a number cannot be verified right now. Add a recovery email instead from your dashboard.</div>') +
-    '<div id="fpMsg"></div>'
-  const send = async (channel) => {
-    const msgEl = box.querySelector('#fpMsg')
-    const phone = phoneDigits(box.querySelector('#pvPhone').value || '')
-    const digits = phone.replace(/\D/g, '')
-    if (digits.length < 7 || digits.length > 15) { if (msgEl) msgEl.innerHTML = otpErrorHtml('Enter a valid mobile number (7-15 digits) with country code'); return }
-    otpState.channel = channel
-    otpState.contact = phone
-    await otpSendAndStep()
-  }
-  box.querySelectorAll('[data-pv-channel]').forEach(b => b.addEventListener('click', () => send(b.getAttribute('data-pv-channel'))))
-  const phoneInput = box.querySelector('#pvPhone')
-  if (phoneInput) { phoneInput.focus(); phoneInput.addEventListener('keydown', e => { if (e.key === 'Enter') send('whatsapp') }) }
-}
-
-function otpVerifiedSave() {
-  const u = currentUser()
-  const users = store.users()
-  const user = users.find(x => x.email === (u ? u.email : otpState.email))
-  if (user && otpState.contact) {
-    user.phone = otpState.contact
-    user.phoneVerified = true
-    store.saveUsers(users)
-  }
-  toast('Mobile number verified - ' + maskPhone(otpState.contact))
-  closeModal()
-  if (pathFromLocation() === '/dashboard') navigate()
 }
 
 /* ---------- recovery email (logged in) ---------- */
@@ -3562,8 +3441,6 @@ function bindView(path, root) {
   if (googleBtn) googleBtn.addEventListener('click', openGoogleModal)
   const fpLink = root.querySelector('[data-fp]')
   if (fpLink) fpLink.addEventListener('click', (e) => { e.preventDefault(); openForgotFlow() })
-  const verifyPhoneBtn = root.querySelector('[data-verify-phone]')
-  if (verifyPhoneBtn) verifyPhoneBtn.addEventListener('click', openPhoneVerify)
   const recEmailBtn = root.querySelector('[data-recovery-email]')
   if (recEmailBtn) recEmailBtn.addEventListener('click', openRecoveryEmail)
   if (path === '/dashboard') loadMyRecoveryEmail()
