@@ -25,6 +25,7 @@ const MIME = {
 // Only these public site files are ever served. Everything else (backend source,
 // backend/.env, .git, node_modules, dotfiles) is NOT reachable over HTTP.
 const PUBLIC_FILES = new Set(['/index.html', '/app.js', '/style.css', '/supabase-client.js', '/robots.txt', '/sitemap.xml', '/og-image.svg'])
+const ROUTE_FALLBACKS = new Set(['/generator', '/tools', '/pricing', '/dashboard', '/admin', '/auth'])
 
 const BAD_UA = /(sqlmap|nikto|nmap|masscan|zgrab|acunetix|nessus|openvas|dirbuster|gobuster|wfuzz|ffuf|hydra|medusa|metasploit|havij|commix|xray|nuclei)/i
 const BAD_PATH = /(^|\/)(wp-admin|wp-login|wp-content|wp-includes|xmlrpc\.php|phpmyadmin|pma|phpunit|\.env|\.git|\.ssh|\.aws|\.docker|\.htaccess|actuator|\.ds_store)(\/|$)/i
@@ -119,19 +120,46 @@ http.createServer((req, res) => {
   const retry = rateLimited(req, 600, 5 * 60 * 1000)
   if (retry) { res.setHeader('Retry-After', String(retry)); return deny(res, 429, 'Too many requests. Please slow down.') }
 
-  const ROUTE_FALLBACKS = new Set(['/generator', '/tools', '/pricing', '/dashboard', '/admin', '/auth'])
   let urlPath = rawPath === '/' ? '/index.html' : rawPath
-  if (ROUTE_FALLBACKS.has(urlPath)) urlPath = '/index.html'
-  if (!PUBLIC_FILES.has(urlPath)) return deny(res, 404, 'Not found')
 
-  const filePath = path.normalize(path.join(ROOT, urlPath))
-  if (filePath !== ROOT && !filePath.startsWith(ROOT + path.sep)) return deny(res, 403, 'Forbidden')
+  const filePath = pickStatic(urlPath)
+  if (!filePath) return deny(res, 404, 'Not found')
   serve(filePath, res)
 }).listen(PORT, '0.0.0.0', () => {
   console.log('Dev server on http://localhost:' + PORT)
   console.log('API proxy -> ' + API_TARGET)
   console.log('Static allowlist: ' + [...PUBLIC_FILES].join(', '))
 })
+
+const DIST = path.join(ROOT, 'dist')
+const hasDist = fs.existsSync(path.join(DIST, 'index.html'))
+
+function safeJoin(base, rel) {
+  const p = path.normalize(path.join(base, rel))
+  if (p !== base && !p.startsWith(base + path.sep)) return null
+  return p
+}
+
+// Prefer the built dist/ output (clean URLs + prerendered SEO pages). Falls back
+// to the source-file allowlist when no build exists.
+function pickStatic(urlPath) {
+  const ext = path.extname(urlPath)
+  if (hasDist) {
+    const tries = ext ? [urlPath] : [urlPath + '.html', path.join(urlPath, 'index.html'), urlPath]
+    for (const t of tries) {
+      const abs = safeJoin(DIST, t)
+      if (abs && fs.existsSync(abs) && fs.statSync(abs).isFile()) return abs
+    }
+    if (!ext) {
+      const spa = path.join(DIST, 'index.html')
+      if (fs.existsSync(spa)) return spa
+    }
+    return null
+  }
+  const target = PUBLIC_FILES.has(urlPath) ? urlPath : (ROUTE_FALLBACKS.has(urlPath) ? '/index.html' : null)
+  if (!target) return null
+  return safeJoin(ROOT, target)
+}
 
 function serve(filePath, res) {
   fs.readFile(filePath, (err, data) => {

@@ -13,17 +13,26 @@
 <link rel="canonical" href="https://seo-service-provider.example/">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="SEO Service Provider">
+<meta property="og:locale" content="en_US">
+<meta property="og:locale:alternate" content="bn_BD">
 <meta property="og:title" content="SEO Service Provider - Free SEO Tools & AI Agents">
 <meta property="og:description" content="Free SEO tools and AI agents with real analysis. Title generator, keyword research, SERP analyzer, rank tracking and more.">
 <meta property="og:url" content="https://seo-service-provider.example/">
 <meta property="og:image" content="https://seo-service-provider.example/og-image.svg">
+<meta property="og:image:type" content="image/svg+xml">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="SEO Service Provider - free SEO tools and AI agents">
 <meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:site" content="@seoproai">
 <meta name="twitter:title" content="SEO Service Provider - Free SEO Tools & AI Agents">
 <meta name="twitter:description" content="Free SEO tools and AI agents with real analysis. No fabricated data.">
 <meta name="twitter:image" content="https://seo-service-provider.example/og-image.svg">
+<meta name="twitter:image:alt" content="SEO Service Provider - free SEO tools and AI agents">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%237c5cff'/><path d='M7 24L13 8h4l6 16h-4l-1.2-3.4h-5.6L11 24H7zm4.6-6.6h3.8L13.5 12l-1.9 5.4z' fill='white'/></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://esm.sh">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Sora:wght@600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css?v=20260907i">
 <script>
@@ -40,20 +49,55 @@
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
-  "@type": "SoftwareApplication",
-  "name": "SEO Service Provider",
-  "applicationCategory": "BusinessApplication",
-  "operatingSystem": "Web",
-  "description": "Free SEO tools and AI agents with real analysis for titles, keywords, SERP and rank tracking.",
-  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
-  "aggregateRating": { "@type": "AggregateRating", "ratingValue": "4.9", "ratingCount": "128" }
+  "@graph": [
+    {
+      "@type": "Organization",
+      "@id": "https://seo-service-provider.example/#organization",
+      "name": "SEO Service Provider",
+      "url": "https://seo-service-provider.example/",
+      "logo": {
+        "@type": "ImageObject",
+        "url": "https://seo-service-provider.example/og-image.svg",
+        "width": 1200,
+        "height": 630
+      },
+      "sameAs": [
+        "https://github.com/FHASHIK27/SEOProAi"
+      ]
+    },
+    {
+      "@type": "WebSite",
+      "@id": "https://seo-service-provider.example/#website",
+      "url": "https://seo-service-provider.example/",
+      "name": "SEO Service Provider",
+      "publisher": { "@id": "https://seo-service-provider.example/#organization" },
+      "inLanguage": ["en", "bn"],
+      "potentialAction": {
+        "@type": "SearchAction",
+        "target": {
+          "@type": "EntryPoint",
+          "urlTemplate": "https://seo-service-provider.example/tools?q={search_term_string}"
+        },
+        "query-input": "required name=search_term_string"
+      }
+    },
+    {
+      "@type": "SoftwareApplication",
+      "name": "SEO Service Provider",
+      "applicationCategory": "BusinessApplication",
+      "operatingSystem": "Web",
+      "url": "https://seo-service-provider.example/",
+      "description": "Free SEO tools and AI agents with real analysis for titles, keywords, SERP and rank tracking.",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+    }
+  ]
 }
 </script>
 <script>
   (function () {
     try {
       var origin = location.origin + '/'
-      document.querySelectorAll('link[rel="canonical"], meta[property="og:url"], meta[property="og:image"], meta[name="twitter:image"]').forEach(function (el) {
+      document.querySelectorAll('link[rel="canonical"], link[rel="alternate"][hreflang], meta[property="og:url"], meta[property="og:image"], meta[name="twitter:image"]').forEach(function (el) {
         var attr = el.tagName === 'LINK' ? 'href' : 'content'
         el.setAttribute(attr, el.getAttribute(attr).replace('https://seo-service-provider.example/', origin))
       })
@@ -79,8 +123,8 @@
       <a href="/generator">Generator</a>
       <a href="/tools">Tools</a>
       <a href="/pricing">Pricing</a>
-      <a href="/dashboard">Dashboard</a>
-      <a href="/admin">Admin</a>
+      <a href="/guides">Guides</a>
+      <a href="/bn">বাংলা</a>
     </nav>
     <div class="nav-actions">
       <a href="/auth" class="btn btn-ghost nav-auth-btn" id="authBtn">Login</a>
@@ -98,6 +142,8 @@
     <a href="/generator">Generator</a>
     <a href="/tools">Tools</a>
     <a href="/pricing">Pricing</a>
+    <a href="/guides">Guides</a>
+    <a href="/bn">বাংলা</a>
     <a href="/dashboard">Dashboard</a>
     <a href="/admin">Admin</a>
   </nav>
@@ -124,8 +170,9 @@
         <a href="/generator">Title Generator</a>
         <a href="/tools">SEO Tools</a>
         <a href="/pricing">Pricing</a>
+        <a href="/guides">SEO Guides</a>
+        <a href="/bn/guides">বাংলা গাইড</a>
         <a href="/dashboard">Dashboard</a>
-        <a href="/admin">Admin</a>
       </div>
       <div class="f-col">
         <h4>Payment Methods</h4>

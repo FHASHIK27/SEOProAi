@@ -1,11 +1,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
+import { SPA_PAGES, STATIC_PAGES, PRIVATE_PAGES, ALL_PAGES } from './seo-content.mjs'
 
 const ROOT = process.cwd()
 const DIST = path.join(ROOT, 'dist')
 const VERSION = '20260907i'
 const PLACEHOLDER = 'https://seo-service-provider.example'
+const BUILD_DATE = new Date().toISOString().slice(0, 10)
 
 // Resolve the real public origin at build time so canonical/OG/sitemap/robots
 // never ship the placeholder domain. On Vercel these env vars are provided
@@ -18,11 +20,21 @@ const SITE_ORIGIN = RAW_SITE
 function withSite(text) {
   return SITE_ORIGIN ? text.split(PLACEHOLDER).join(SITE_ORIGIN) : text
 }
+function absUrl(p) {
+  const base = SITE_ORIGIN || PLACEHOLDER
+  return base + (p === '/' ? '/' : p)
+}
 
 fs.mkdirSync(DIST, { recursive: true })
 
 function read(p) { return fs.readFileSync(path.join(ROOT, p), 'utf8') }
 function write(p, s) { fs.writeFileSync(path.join(DIST, p), s) }
+function writePage(p, s) {
+  const rel = p === '/' ? 'index.html' : p.replace(/^\//, '') + '.html'
+  const abs = path.join(DIST, rel)
+  fs.mkdirSync(path.dirname(abs), { recursive: true })
+  fs.writeFileSync(abs, s)
+}
 
 // ---- JS: terser (mangle + compress) ----
 function minifyJs(code) {
@@ -52,53 +64,116 @@ write('app.min.js', minifyJs(appJs))
 write('style.min.css', minifyCss(styleCss))
 write('supabase-client.js', minifyJs(read('supabase-client.js')))
 
-// ---- HTML: point to minified assets ----
+// ---- HTML base (SPA) with minified asset references ----
 let html = read('index.html')
 html = html
   .replace(/style\.css\?v=[0-9a-z]+/g, 'style.min.css?v=' + VERSION)
   .replace(/app\.js\?v=[0-9a-z]+/g, 'app.min.js?v=' + VERSION)
   .replace(/supabase-client\.js\?v=[0-9a-z]+/g, 'supabase-client.js?v=' + VERSION)
-write('index.html', withSite(html))
-
-// ---- prerender crawlable HTML for public routes ----
-const PRERENDER = [
-  {
-    path: '/generator',
-    title: 'Free SEO Title Generator - 10 AI Titles with Scores',
-    desc: 'Generate 10 click-worthy SEO titles from one primary keyword, each scored for length, power words and search intent. Free to try.',
-    h1: 'Free SEO Title Generator',
-    body: '<p>Type one primary keyword and get 10 SEO-optimized title ideas instantly. Every title is scored for ideal pixel length, power words and search intent so you can pick the best one without guessing.</p>' +
-      '<ul><li>10 unique title variations per keyword</li><li>Live length and pixel-width scoring</li><li>Power-word and intent labels</li><li>Copy-ready titles for your CMS</li></ul>' +
-      '<p><a href="/dashboard">Open the generator</a> - free and no credit card required.</p>'
-  },
-  {
-    path: '/tools',
-    title: 'Free SEO Tools - Keyword, SERP, PageSpeed & SEO Audit',
-    desc: 'Run real SEO analysis: keyword research, SERP analyzer, competitor analysis, People-Also-Ask questions, PageSpeed and a full SEO audit.',
-    h1: 'Free SEO Tools for Real Analysis',
-    body: '<p>Ten practical SEO tools in one place. Each one returns real analysis so you can act on it immediately instead of reading filler.</p>' +
-      '<ul><li>SEO Title Generator</li><li>Meta Description Generator</li><li>Keyword Research</li><li>SERP Analyzer</li><li>Competitor Analysis</li><li>People-Also-Ask Questions</li><li>PageSpeed Checker</li><li>Full SEO Audit</li><li>Local SEO Check</li><li>Rank Tracker</li></ul>' +
-      '<p><a href="/dashboard">Launch a tool</a> or <a href="/pricing">compare plans</a>.</p>'
-  },
-  {
-    path: '/pricing',
-    title: 'Pricing & Plans - SEO Service Provider',
-    desc: 'Simple SEO plans for freelancers and agencies. Unlock more AI agents, higher daily credits and priority usage. Pay by mobile, bank or crypto.',
-    h1: 'Simple SEO Pricing &amp; Plans',
-    body: '<p>Start free, then upgrade when you need more AI agents, higher daily credits and priority processing. No hidden fees.</p>' +
-      '<ul><li>Free - core tools and limited daily credits</li><li>Starter - more agents and higher limits</li><li>Pro - priority AI usage for freelancers</li><li>Agency - high-volume credits for teams</li></ul>' +
-      '<p><a href="/dashboard">Create a free account</a> to begin.</p>'
-  }
-]
 
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
-function renderPage(baseHtml, route) {
-  const url = PLACEHOLDER + (route.path === '/' ? '/' : route.path)
-  const title = escapeHtml(route.title)
-  const desc = escapeHtml(route.desc)
+// ---- hreflang groups ----
+const langGroups = {}
+for (const p of ALL_PAGES) {
+  if (!p.key) continue
+  ;(langGroups[p.key] = langGroups[p.key] || {})[p.lang || 'en'] = p
+}
+function altLinks(page) {
+  const group = page.key ? langGroups[page.key] : null
+  if (!group || !group.en || !group.bn) return ''
+  const en = absUrl(group.en.path)
+  const bn = absUrl(group.bn.path)
+  return [
+    '<link rel="alternate" hreflang="en" href="' + escapeHtml(en) + '">',
+    '<link rel="alternate" hreflang="bn" href="' + escapeHtml(bn) + '">',
+    '<link rel="alternate" hreflang="x-default" href="' + escapeHtml(en) + '">'
+  ].join('\n')
+}
+
+// ---- JSON-LD per page ----
+const ORG_ID = PLACEHOLDER + '/#organization'
+const SITE_ID = PLACEHOLDER + '/#website'
+
+function breadcrumbNode(page) {
+  if (!page.breadcrumb || page.breadcrumb.length < 2) return null
+  return {
+    '@type': 'BreadcrumbList',
+    itemListElement: page.breadcrumb.map((b, i) => ({
+      '@type': 'ListItem',
+      position: i + 1,
+      name: b.name,
+      item: absUrl(b.url)
+    }))
+  }
+}
+function faqNode(page) {
+  if (!page.faq || !page.faq.length) return null
+  return {
+    '@type': 'FAQPage',
+    mainEntity: page.faq.map(f => ({
+      '@type': 'Question',
+      name: f.q,
+      acceptedAnswer: { '@type': 'Answer', text: f.a }
+    }))
+  }
+}
+function primaryNode(page) {
+  const url = absUrl(page.path)
+  if (page.type === 'article') {
+    return {
+      '@type': 'BlogPosting',
+      '@id': url + '#article',
+      headline: page.h1 ? page.h1.replace(/&amp;/g, '&') : page.title,
+      description: page.desc,
+      inLanguage: page.lang || 'en',
+      datePublished: page.updated,
+      dateModified: page.updated,
+      mainEntityOfPage: url,
+      author: { '@id': ORG_ID },
+      publisher: { '@id': ORG_ID }
+    }
+  }
+  if (page.type === 'product') {
+    return {
+      '@type': 'Product',
+      name: 'SEO Service Provider',
+      description: page.desc,
+      brand: { '@id': ORG_ID },
+      url
+    }
+  }
+  const node = {
+    '@type': page.type === 'website' && page.path === '/' ? 'WebSite' : 'WebPage',
+    '@id': url + '#webpage',
+    url,
+    name: page.title,
+    description: page.desc,
+    inLanguage: page.lang || 'en',
+    isPartOf: { '@id': SITE_ID }
+  }
+  return node
+}
+function jsonLdScript(page) {
+  const graph = [primaryNode(page), breadcrumbNode(page), faqNode(page)].filter(Boolean)
+  return '<script type="application/ld+json">\n' +
+    JSON.stringify({ '@context': 'https://schema.org', '@graph': graph }, null, 2) +
+    '\n</script>'
+}
+
+// ---- head injection for SPA pages (base index.html) ----
+function localeMeta(page) {
+  const locale = (page.lang || 'en') === 'bn' ? 'bn_BD' : 'en_US'
+  const alt = (page.lang || 'en') === 'bn' ? 'en_US' : 'bn_BD'
+  return { locale, alt }
+}
+function injectHead(baseHtml, page, opts) {
+  const url = absUrl(page.path)
+  const title = escapeHtml(page.title)
+  const desc = escapeHtml(page.desc)
+  const { locale, alt } = localeMeta(page)
   let out = baseHtml
   out = out.replace(/<title>[\s\S]*?<\/title>/, '<title>' + title + '</title>')
   out = out.replace(/(<meta name="description" content=")[^"]*(")/, '$1' + desc + '$2')
@@ -106,32 +181,241 @@ function renderPage(baseHtml, route) {
   out = out.replace(/(<meta property="og:title" content=")[^"]*(")/, '$1' + title + '$2')
   out = out.replace(/(<meta property="og:description" content=")[^"]*(")/, '$1' + desc + '$2')
   out = out.replace(/(<meta property="og:url" content=")[^"]*(")/, '$1' + url + '$2')
+  out = out.replace(/(<meta property="og:locale" content=")[^"]*(")/, '$1' + locale + '$2')
+  out = out.replace(/(<meta property="og:locale:alternate" content=")[^"]*(")/, '$1' + alt + '$2')
   out = out.replace(/(<meta name="twitter:title" content=")[^"]*(")/, '$1' + title + '$2')
   out = out.replace(/(<meta name="twitter:description" content=")[^"]*(")/, '$1' + desc + '$2')
-  const block = '<section class="prerender container"><h1>' + route.h1 + '</h1>' + route.body + '</section>'
-  out = out.replace('<main class="main" id="mainView"></main>', '<main class="main" id="mainView">' + block + '</main>')
+  out = out.replace(/<html lang="[^"]*"/, '<html lang="' + (page.lang || 'en') + '">')
+  if (opts && opts.noindex) {
+    out = out.replace(/<meta name="robots"[^>]*>/, '<meta name="robots" content="noindex, nofollow">')
+  }
+  const extra = altLinks(page) + (opts && opts.noindex ? '' : '\n' + jsonLdScript(page))
+  out = out.replace('</head>', extra + '\n</head>')
   return withSite(out)
 }
 
-for (const route of PRERENDER) {
-  const rel = route.path === '/' ? 'index.html' : route.path.replace(/^\//, '') + '.html'
-  const abs = path.join(DIST, rel)
-  fs.mkdirSync(path.dirname(abs), { recursive: true })
-  fs.writeFileSync(abs, renderPage(html, route))
+// ---- static shell (no app.js) for content pages ----
+const PRERENDER_STYLE = [
+  '<style>',
+  '.prerender .lead{font-size:19px;color:#cbd5e1;margin:0 0 22px}',
+  '.prerender h2{font-family:var(--font-display);font-size:1.4rem;margin:28px 0 10px;color:var(--text)}',
+  '.prerender .faq-item{border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin:10px 0;background:var(--bg-soft)}',
+  '.prerender .faq-item h3{margin:0 0 6px;font-size:1rem}',
+  '.prerender .guide-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin:22px 0}',
+  '.prerender .guide-card{border:1px solid var(--border);border-radius:14px;padding:18px;background:var(--bg-soft);display:block;color:var(--text)}',
+  '.prerender .guide-card:hover{border-color:var(--primary)}',
+  '.prerender .guide-card b{display:block;margin-bottom:6px;font-size:1.05rem}',
+  '.prerender .guide-card span{color:var(--muted);font-size:14px}',
+  '.prerender .crumbs{font-size:13px;color:var(--muted);margin-bottom:16px}',
+  '.prerender .crumbs a{color:var(--muted)}',
+  '.prerender .cta{margin:26px 0;padding:18px;border:1px solid var(--border);border-radius:14px;background:var(--bg-soft)}',
+  '@media(max-width:720px){.prerender .guide-grid{grid-template-columns:1fr}}',
+  '</style>'
+].join('')
+
+function header(en) {
+  if (en) {
+    return '<header class="navbar"><div class="container nav-inner">' +
+      '<a href="/" class="logo">SEO<span class="logo-dot">Pro</span><span class="logo-badge">AI</span></a>' +
+      '<nav class="nav-links">' +
+      '<a href="/">Home</a><a href="/generator">Generator</a><a href="/tools">Tools</a>' +
+      '<a href="/pricing">Pricing</a><a href="/guides">Guides</a><a href="/dashboard">Dashboard</a>' +
+      '</nav>' +
+      '<div class="nav-actions"><a href="/bn" class="btn btn-ghost">বাংলা</a>' +
+      '<a href="/dashboard" class="btn btn-primary">Get Started</a></div>' +
+      '</div></header>'
+  }
+  return '<header class="navbar"><div class="container nav-inner">' +
+    '<a href="/bn" class="logo">SEO<span class="logo-dot">Pro</span><span class="logo-badge">AI</span></a>' +
+    '<nav class="nav-links">' +
+    '<a href="/bn">হোম</a><a href="/generator">টুলস</a><a href="/bn/guides">গাইড</a><a href="/pricing">প্রাইসিং</a>' +
+    '</nav>' +
+    '<div class="nav-actions"><a href="/" class="btn btn-ghost">English</a>' +
+    '<a href="/dashboard" class="btn btn-primary">শুরু করুন</a></div>' +
+    '</div></header>'
 }
 
+function footer(en) {
+  const year = 2026
+  if (en) {
+    return '<footer class="footer"><div class="container"><div class="footer-grid">' +
+      '<div class="f-brand"><div class="logo">SEO<span class="logo-dot">Pro</span><span class="logo-badge">AI</span></div>' +
+      '<p>Free SEO tools &amp; AI agents - real analysis, no fabricated data.</p>' +
+      '<div class="f-contact"><span>WhatsApp: <b>+880 1886-822816</b></span><span>Telegram: <b>t.me/+8801886822816</b></span></div></div>' +
+      '<div class="f-col"><h4>Tools</h4><a href="/generator">Title Generator</a><a href="/tools">SEO Tools</a><a href="/pricing">Pricing</a><a href="/dashboard">Dashboard</a></div>' +
+      '<div class="f-col"><h4>Guides</h4><a href="/guides/free-seo-title-generator-guide">SEO Titles</a><a href="/guides/keyword-research-basics">Keyword Research</a><a href="/guides/local-seo-checklist">Local SEO</a><a href="/guides/meta-description-tips">Meta Descriptions</a></div>' +
+      '<div class="f-col"><h4>Language</h4><a href="/guides">English</a><a href="/bn/guides">বাংলা গাইড</a></div>' +
+      '</div><div class="footer-bottom">&copy; ' + year + ' SEO Service Provider - Free SEO Tools &amp; AI Agents</div></div></footer>'
+  }
+  return '<footer class="footer"><div class="container"><div class="footer-grid">' +
+    '<div class="f-brand"><div class="logo">SEO<span class="logo-dot">Pro</span><span class="logo-badge">AI</span></div>' +
+    '<p>ফ্রি এসইও টুলস ও এআই এজেন্ট - বাস্তব বিশ্লেষণ, বানানো ডেটা নয়।</p>' +
+    '<div class="f-contact"><span>WhatsApp: <b>+880 1886-822816</b></span><span>Telegram: <b>t.me/+8801886822816</b></span></div></div>' +
+    '<div class="f-col"><h4>টুলস</h4><a href="/generator">টাইটেল জেনারেটর</a><a href="/tools">এসইও টুলস</a><a href="/pricing">প্রাইসিং</a><a href="/dashboard">ড্যাশবোর্ড</a></div>' +
+    '<div class="f-col"><h4>গাইড</h4><a href="/bn/guides/free-seo-title-generator-guide">টাইটেল লেখা</a><a href="/bn/guides/keyword-research-basics">কীওয়ার্ড রিসার্চ</a><a href="/bn/guides/local-seo-checklist">লোকাল এসইও</a><a href="/bn/guides/meta-description-tips">মেটা ডেসক্রিপশন</a></div>' +
+    '<div class="f-col"><h4>ভাষা</h4><a href="/guides">English</a><a href="/bn/guides">বাংলা</a></div>' +
+    '</div><div class="footer-bottom">&copy; ' + year + ' SEO Service Provider - ফ্রি এসইও টুলস ও এআই এজেন্ট</div></div></footer>'
+}
+
+function crumbs(page) {
+  if (!page.breadcrumb || page.breadcrumb.length < 2) return ''
+  return '<nav class="crumbs" aria-label="Breadcrumb">' +
+    page.breadcrumb.map((b, i) => '<a href="' + escapeHtml(b.url) + '">' + escapeHtml(b.name) + '</a>').join(' &rsaquo; ') +
+    '</nav>'
+}
+
+function renderSections(page) {
+  if (!page.sections) return ''
+  return page.sections.map(s => {
+    let h = '<h2>' + escapeHtml(s.h2) + '</h2>'
+    if (s.p) h += '<p>' + escapeHtml(s.p) + '</p>'
+    if (s.list) h += '<ul>' + s.list.map(li => '<li>' + escapeHtml(li) + '</li>').join('') + '</ul>'
+    return h
+  }).join('')
+}
+function renderFaq(page) {
+  if (!page.faq || !page.faq.length) return ''
+  const en = (page.lang || 'en') === 'en'
+  return '<h2>' + (en ? 'Frequently asked questions' : 'সচরাচর জিজ্ঞাসা') + '</h2>' +
+    page.faq.map(f =>
+      '<div class="faq-item"><h3>' + escapeHtml(f.q) + '</h3><p>' + escapeHtml(f.a) + '</p></div>'
+    ).join('')
+}
+function renderGuidesGrid(page) {
+  if (!page.guides) return ''
+  const base = (page.lang || 'en') === 'bn' ? '/bn/guides/' : '/guides/'
+  return '<div class="guide-grid">' + page.guides.map(g =>
+    '<a class="guide-card" href="' + base + g.slug + '"><b>' + escapeHtml(g.h1) + '</b><span>' + escapeHtml(g.excerpt) + '</span></a>'
+  ).join('') + '</div>'
+}
+function renderCta(page) {
+  const en = (page.lang || 'en') === 'en'
+  return '<div class="cta"><p>' + (en
+    ? 'Put this guide to work with a free tool - no credit card required.'
+    : 'এই গাইডটি ফ্রি টুল দিয়ে এখনই প্রয়োগ করুন - কার্ডের প্রয়োজন নেই।') + '</p>' +
+    '<p><a class="btn btn-primary" href="/generator">' + (en ? 'Open the free title generator' : 'ফ্রি টাইটেল জেনারেটর খুলুন') + '</a> ' +
+    '<a class="btn btn-ghost" href="/tools">' + (en ? 'Browse all SEO tools' : 'সব এসইও টুল দেখুন') + '</a></p></div>'
+}
+
+function renderStatic(page) {
+  const lang = page.lang || 'en'
+  const en = lang === 'en'
+  const url = absUrl(page.path)
+  const title = escapeHtml(page.title)
+  const desc = escapeHtml(page.desc)
+  const { locale } = localeMeta(page)
+  const head = [
+    '<!doctype html>',
+    '<html lang="' + lang + '">',
+    '<head>',
+    '<meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    '<title>' + title + '</title>',
+    '<meta name="description" content="' + desc + '">',
+    '<meta name="robots" content="index, follow, max-image-preview:large">',
+    '<meta name="theme-color" content="#0b0e17">',
+    '<link rel="canonical" href="' + url + '">',
+    '<meta property="og:type" content="' + (page.type === 'article' ? 'article' : 'website') + '">',
+    '<meta property="og:site_name" content="SEO Service Provider">',
+    '<meta property="og:locale" content="' + locale + '">',
+    '<meta property="og:title" content="' + title + '">',
+    '<meta property="og:description" content="' + desc + '">',
+    '<meta property="og:url" content="' + url + '">',
+    '<meta property="og:image" content="' + absUrl('/og-image.svg') + '">',
+    '<meta property="og:image:type" content="image/svg+xml">',
+    '<meta property="og:image:width" content="1200">',
+    '<meta property="og:image:height" content="630">',
+    '<meta name="twitter:card" content="summary_large_image">',
+    '<meta name="twitter:title" content="' + title + '">',
+    '<meta name="twitter:description" content="' + desc + '">',
+    '<meta name="twitter:image" content="' + absUrl('/og-image.svg') + '">',
+    '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 32 32\'><rect width=\'32\' height=\'32\' rx=\'8\' fill=\'%237c5cff\'/></svg>">',
+    '<link rel="preconnect" href="https://fonts.googleapis.com">',
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>',
+    '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Sora:wght@600;700;800&display=swap" rel="stylesheet">',
+    '<link rel="stylesheet" href="/style.min.css?v=' + VERSION + '">',
+    PRERENDER_STYLE,
+    altLinks(page),
+    jsonLdScript(page),
+    '</head>'
+  ].join('\n')
+
+  let bodyInner = crumbs(page)
+  bodyInner += '<h1>' + (page.h1 || title) + '</h1>'
+  if (page.excerpt) bodyInner += '<p class="lead">' + escapeHtml(page.excerpt) + '</p>'
+  if (page.intro) bodyInner += '<p>' + escapeHtml(page.intro) + '</p>'
+  bodyInner += renderGuidesGrid(page)
+  if (page.sections && !page.guides) bodyInner += renderSections(page)
+  bodyInner += renderCta(page)
+  bodyInner += renderFaq(page)
+
+  const body = [
+    '<body>',
+    '<div class="bg-orbs" aria-hidden="true"><span class="orb o1"></span><span class="orb o2"></span><span class="orb o3"></span></div>',
+    header(en),
+    '<main class="main"><section class="prerender">' + bodyInner + '</section></main>',
+    footer(en),
+    '</body>',
+    '</html>'
+  ].join('\n')
+
+  return withSite(head + '\n' + body)
+}
+
+// ---- emit pages ----
+for (const page of SPA_PAGES) {
+  writePage(page.path, injectHead(html, page, { noindex: false }))
+}
+for (const page of PRIVATE_PAGES) {
+  writePage(page.path, injectHead(html, page, { noindex: true }))
+}
+for (const page of STATIC_PAGES) {
+  writePage(page.path, renderStatic(page))
+}
+
+// ---- sitemap ----
+function sitemapUrl(page) {
+  const lines = ['  <url>', '    <loc>' + absUrl(page.path) + '</loc>', '    <lastmod>' + (page.updated || BUILD_DATE) + '</lastmod>']
+  const group = page.key ? langGroups[page.key] : null
+  if (group && group.en && group.bn) {
+    lines.push('    <xhtml:link rel="alternate" hreflang="en" href="' + absUrl(group.en.path) + '"/>')
+    lines.push('    <xhtml:link rel="alternate" hreflang="bn" href="' + absUrl(group.bn.path) + '"/>')
+    lines.push('    <xhtml:link rel="alternate" hreflang="x-default" href="' + absUrl(group.en.path) + '"/>')
+  }
+  lines.push('  </url>')
+  return lines.join('\n')
+}
+const sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n' +
+  '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">\n' +
+  [...SPA_PAGES, ...STATIC_PAGES].map(sitemapUrl).join('\n') + '\n' +
+  '</urlset>\n'
+write('sitemap.xml', withSite(sitemap))
+
+// ---- robots ----
+const robots = [
+  'User-agent: *',
+  'Allow: /',
+  'Disallow: /api/',
+  'Disallow: /dashboard',
+  'Disallow: /auth',
+  'Disallow: /admin',
+  '',
+  'Sitemap: ' + absUrl('/sitemap.xml'),
+  ''
+].join('\n')
+write('robots.txt', robots)
+
 // ---- static assets ----
-for (const f of ['robots.txt', 'sitemap.xml', 'og-image.svg']) {
-  if (!fs.existsSync(path.join(ROOT, f))) continue
-  if (f === 'og-image.svg') { fs.copyFileSync(path.join(ROOT, f), path.join(DIST, f)); continue }
-  write(f, withSite(read(f)))
+if (fs.existsSync(path.join(ROOT, 'og-image.svg'))) {
+  fs.copyFileSync(path.join(ROOT, 'og-image.svg'), path.join(DIST, 'og-image.svg'))
 }
 
 console.log('Public origin: ' + (SITE_ORIGIN || '(placeholder - set SITE_URL on your host)'))
-
 console.log('Build complete -> dist/')
 console.log('  app.min.js', (fs.statSync(path.join(DIST, 'app.min.js')).size / 1024).toFixed(1) + 'kb')
 console.log('  style.min.css', (fs.statSync(path.join(DIST, 'style.min.css')).size / 1024).toFixed(1) + 'kb')
 console.log('  supabase-client.js', (fs.statSync(path.join(DIST, 'supabase-client.js')).size / 1024).toFixed(1) + 'kb')
-console.log('  index.html + robots.txt + sitemap.xml + og-image.svg')
-console.log('  prerendered: /generator, /tools, /pricing (+ SPA routes via rewrite)')
+console.log('  SPA pages: ' + SPA_PAGES.map(p => p.path).join(', '))
+console.log('  private: ' + PRIVATE_PAGES.map(p => p.path).join(', '))
+console.log('  static: ' + STATIC_PAGES.length + ' pages (guides en+bn)')
+console.log('  sitemap.xml (' + (SPA_PAGES.length + STATIC_PAGES.length) + ' urls), robots.txt, og-image.svg')

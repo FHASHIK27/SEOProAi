@@ -5,10 +5,7 @@
   "cleanUrls": true,
   "trailingSlash": false,
   "rewrites": [
-    { "source": "/api/:path*", "destination": "/api" },
-    { "source": "/dashboard", "destination": "/index.html" },
-    { "source": "/admin", "destination": "/index.html" },
-    { "source": "/auth", "destination": "/index.html" }
+    { "source": "/api/:path*", "destination": "/api" }
   ],
   "functions": {
     "api/index.js": {
@@ -32,6 +29,12 @@
         { "key": "Permissions-Policy", "value": "geolocation=(), microphone=(), camera=()" },
         { "key": "Strict-Transport-Security", "value": "max-age=15552000; includeSubDomains" },
         { "key": "Content-Security-Policy", "value": "default-src 'self'; script-src 'self' 'unsafe-inline' https://esm.sh; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://*.supabase.co; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" }
+      ]
+    },
+    {
+      "source": "/(dashboard|auth|admin)",
+      "headers": [
+        { "key": "X-Robots-Tag", "value": "noindex, nofollow" }
       ]
     },
     {
