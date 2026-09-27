@@ -25,6 +25,17 @@ function absUrl(p) {
   return base + (p === '/' ? '/' : p)
 }
 
+// Search Console / Bing verification codes (set as env vars on the host).
+// Build-time only: no runtime cost, and empty values are simply omitted.
+const GOOGLE_VERIFY = (process.env.GOOGLE_SITE_VERIFICATION || '').trim()
+const BING_VERIFY = (process.env.BING_SITE_VERIFICATION || '').trim()
+function verificationMeta() {
+  const tags = []
+  if (GOOGLE_VERIFY) tags.push('<meta name="google-site-verification" content="' + GOOGLE_VERIFY + '">')
+  if (BING_VERIFY) tags.push('<meta name="msvalidate.01" content="' + BING_VERIFY + '">')
+  return tags.join('\n')
+}
+
 fs.mkdirSync(DIST, { recursive: true })
 
 function read(p) { return fs.readFileSync(path.join(ROOT, p), 'utf8') }
@@ -189,7 +200,7 @@ function injectHead(baseHtml, page, opts) {
   if (opts && opts.noindex) {
     out = out.replace(/<meta name="robots"[^>]*>/, '<meta name="robots" content="noindex, nofollow">')
   }
-  const extra = altLinks(page) + (opts && opts.noindex ? '' : '\n' + jsonLdScript(page))
+  const extra = altLinks(page) + (opts && opts.noindex ? '' : '\n' + verificationMeta() + '\n' + jsonLdScript(page))
   out = out.replace('</head>', extra + '\n</head>')
   return withSite(out)
 }
@@ -336,6 +347,7 @@ function renderStatic(page) {
     '<link rel="stylesheet" href="/style.min.css?v=' + VERSION + '">',
     PRERENDER_STYLE,
     altLinks(page),
+    verificationMeta(),
     jsonLdScript(page),
     '</head>'
   ].join('\n')
