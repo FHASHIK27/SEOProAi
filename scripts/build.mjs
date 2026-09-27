@@ -35,6 +35,9 @@ function verificationMeta() {
   if (BING_VERIFY) tags.push('<meta name="msvalidate.01" content="' + BING_VERIFY + '">')
   return tags.join('\n')
 }
+function rssLink() {
+  return '<link rel="alternate" type="application/rss+xml" title="SEO Service Provider - Guides" href="' + absUrl('/feed.xml') + '">'
+}
 
 fs.mkdirSync(DIST, { recursive: true })
 
@@ -200,7 +203,7 @@ function injectHead(baseHtml, page, opts) {
   if (opts && opts.noindex) {
     out = out.replace(/<meta name="robots"[^>]*>/, '<meta name="robots" content="noindex, nofollow">')
   }
-  const extra = altLinks(page) + (opts && opts.noindex ? '' : '\n' + verificationMeta() + '\n' + jsonLdScript(page))
+  const extra = altLinks(page) + (opts && opts.noindex ? '' : '\n' + verificationMeta() + '\n' + rssLink() + '\n' + jsonLdScript(page))
   out = out.replace('</head>', extra + '\n</head>')
   return withSite(out)
 }
@@ -348,6 +351,7 @@ function renderStatic(page) {
     PRERENDER_STYLE,
     altLinks(page),
     verificationMeta(),
+    rssLink(),
     jsonLdScript(page),
     '</head>'
   ].join('\n')
@@ -403,6 +407,31 @@ const sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n' +
   '</urlset>\n'
 write('sitemap.xml', withSite(sitemap))
 
+// ---- RSS feed for guides/articles ----
+const feedItems = STATIC_PAGES.filter(p => p.type === 'article').map(p => {
+  const url = absUrl(p.path)
+  const pub = new Date(p.updated + 'T00:00:00Z').toUTCString()
+  return [
+    '    <item>',
+    '      <title>' + escapeHtml(p.title) + '</title>',
+    '      <link>' + url + '</link>',
+    '      <guid isPermaLink="true">' + url + '</guid>',
+    '      <description>' + escapeHtml(p.desc) + '</description>',
+    '      <pubDate>' + pub + '</pubDate>',
+    '    </item>'
+  ].join('\n')
+}).join('\n')
+const feed = '<?xml version="1.0" encoding="UTF-8"?>\n' +
+  '<rss version="2.0"><channel>\n' +
+  '  <title>SEO Service Provider - Guides</title>\n' +
+  '  <link>' + absUrl('/guides') + '</link>\n' +
+  '  <description>Free practical SEO guides and tutorials from SEO Service Provider.</description>\n' +
+  '  <language>en</language>\n' +
+  '  <lastBuildDate>' + new Date(BUILD_DATE + 'T00:00:00Z').toUTCString() + '</lastBuildDate>\n' +
+  feedItems + '\n' +
+  '</channel></rss>\n'
+write('feed.xml', withSite(feed))
+
 // ---- robots ----
 const robots = [
   'User-agent: *',
@@ -417,6 +446,11 @@ const robots = [
 ].join('\n')
 write('robots.txt', robots)
 
+// ---- IndexNow key file (hosted at /<key>.txt for Bing/Yandex submissions) ----
+let indexNowKey = ''
+try { indexNowKey = fs.readFileSync(path.join(ROOT, 'indexnow-key.txt'), 'utf8').trim().split(/\s+/)[0] } catch (e) {}
+if (indexNowKey) write(indexNowKey + '.txt', indexNowKey + '\n')
+
 // ---- static assets ----
 if (fs.existsSync(path.join(ROOT, 'og-image.svg'))) {
   fs.copyFileSync(path.join(ROOT, 'og-image.svg'), path.join(DIST, 'og-image.svg'))
@@ -430,4 +464,5 @@ console.log('  supabase-client.js', (fs.statSync(path.join(DIST, 'supabase-clien
 console.log('  SPA pages: ' + SPA_PAGES.map(p => p.path).join(', '))
 console.log('  private: ' + PRIVATE_PAGES.map(p => p.path).join(', '))
 console.log('  static: ' + STATIC_PAGES.length + ' pages (guides en+bn)')
-console.log('  sitemap.xml (' + (SPA_PAGES.length + STATIC_PAGES.length) + ' urls), robots.txt, og-image.svg')
+console.log('  sitemap.xml (' + (SPA_PAGES.length + STATIC_PAGES.length) + ' urls), robots.txt, feed.xml, og-image.svg')
+if (indexNowKey) console.log('  IndexNow key file: /' + indexNowKey + '.txt')
