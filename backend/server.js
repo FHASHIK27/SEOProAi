@@ -1865,6 +1865,30 @@ app.get('/api/dev/file', devGate, (req, res) => {
 // ---------------------------------------------------------------- backup export / import
 const BACKUP_SKIP = new Set(['node_modules', '.git', '.monkeycode-tmp-files', 'dist', '.cache', '__pycache__', '.venv', 'coverage', '.vercel', '.v8-cache', '___vc', '.next'])
 const BACKUP_ALLOW_DOT = new Set(['.env', '.gitignore'])
+// Env vars copied into a generated .env inside the backup when
+// BACKUP_INCLUDE_ENV=1 (owner opt-in). Default is OFF so secrets are never
+// shipped from a hosted deployment unless you explicitly ask for it.
+const BACKUP_ENV_KEYS = [
+  'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY',
+  'SERPAPI_API_KEY', 'PAGESPEED_API_KEY', 'GEMINI_API_KEY', 'GEMINI_MODEL',
+  'BSCSCAN_API_KEY', 'ETHERSCAN_API_KEY', 'ARBISCAN_API_KEY', 'TRONGRID_API_KEY',
+  'SMTP_HOST', 'SMTP_PORT', 'SMTP_SECURE', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', 'EMAIL_FROM',
+  'GMAIL_APPS_SCRIPT_URL', 'GMAIL_APPS_SCRIPT_SECRET', 'RESEND_API_KEY', 'BREVO_API_KEY',
+  'ADMIN_EMAILS', 'ADMIN_PASSWORD', 'ADMIN_SECRET', 'DEV_KEY',
+  'ALLOWED_ORIGINS', 'SUPPORT_WHATSAPP', 'ENABLE_DEV_ROUTES',
+  'GOOGLE_SITE_VERIFICATION', 'BING_SITE_VERIFICATION'
+]
+
+function buildEnvFile() {
+  const lines = []
+  for (const k of BACKUP_ENV_KEYS) {
+    const v = process.env[k]
+    if (v === undefined || v === '') continue
+    const safe = /^[A-Za-z0-9_.:/@+\-]*$/.test(v) ? v : '"' + String(v).replace(/"/g, '\\"') + '"'
+    lines.push(k + '=' + safe)
+  }
+  return lines.join('\n') + '\n'
+}
 
 function collectBackupEntries(root) {
   const entries = []
@@ -1891,6 +1915,10 @@ function collectBackupEntries(root) {
 app.get('/api/dev/export', devGate, (req, res) => {
   try {
     const entries = collectBackupEntries(PROJECT_ROOT)
+    const hasEnv = entries.some(e => e.name === '.env' || e.name === 'backend/.env')
+    if (!hasEnv && process.env.BACKUP_INCLUDE_ENV === '1') {
+      entries.push({ name: '.env', data: Buffer.from(buildEnvFile()) })
+    }
     const zip = createZip(entries)
     const date = new Date().toISOString().slice(0, 10)
     res.writeHead(200, {

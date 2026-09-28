@@ -9,12 +9,12 @@
   ],
   "functions": {
     "api/index.js": {
-      "includeFiles": "{backend/**/*,scripts/**/*,supabase/**/*,api/**/*,*.js,*.html,*.css,*.json,*.txt,*.xml,*.svg,*.md}",
+      "includeFiles": "{backend/**/*,scripts/**/*,supabase/**/*,api/**/*,*.js,*.html,*.css,*.json,*.txt,*.xml,*.svg,*.md,.gitignore,.vercelignore}",
       "memory": 1024,
       "maxDuration": 60
     },
     "api/[...path].js": {
-      "includeFiles": "{backend/**/*,scripts/**/*,supabase/**/*,api/**/*,*.js,*.html,*.css,*.json,*.txt,*.xml,*.svg,*.md}",
+      "includeFiles": "{backend/**/*,scripts/**/*,supabase/**/*,api/**/*,*.js,*.html,*.css,*.json,*.txt,*.xml,*.svg,*.md,.gitignore,.vercelignore}",
       "memory": 1024,
       "maxDuration": 60
     }
