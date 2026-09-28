@@ -5,7 +5,7 @@ import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import dns from 'node:dns/promises'
-import { spawn } from 'node:child_process'
+import { createZip, readZip } from './ziptools/zip.js'
 
 dotenv.config()
 
@@ -1797,7 +1797,7 @@ function devHandoffBrief(files, endpoints, gmailConfigured) {
 
 // ---------------------------------------------------------------- code explorer (tree + file viewer)
 const CODE_EXTS = new Set(['js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'css', 'html', 'json', 'md', 'txt', 'sh', 'yml', 'yaml', 'svg', 'toml', 'ini', 'xml'])
-const TREE_SKIP = new Set(['node_modules', '.git', '.monkeycode-tmp-files', 'dist', '.cache', '__pycache__', '.venv', 'coverage'])
+const TREE_SKIP = new Set(['node_modules', '.git', '.monkeycode-tmp-files', 'dist', '.cache', '__pycache__', '.venv', 'coverage', '.vercel', '.v8-cache', '___vc', '.next'])
 const TREE_MAX_DEPTH = 4
 const TREE_MAX_ITEMS = 700
 
@@ -1863,21 +1863,46 @@ app.get('/api/dev/file', devGate, (req, res) => {
 })
 
 // ---------------------------------------------------------------- backup export / import
-const ZIPTOOLS_DIR = path.join(path.dirname(new URL(import.meta.url).pathname), 'ziptools')
+const BACKUP_SKIP = new Set(['node_modules', '.git', '.monkeycode-tmp-files', 'dist', '.cache', '__pycache__', '.venv', 'coverage', '.vercel', '.v8-cache', '___vc', '.next'])
+const BACKUP_ALLOW_DOT = new Set(['.env', '.gitignore'])
+
+function collectBackupEntries(root) {
+  const entries = []
+  const walk = (dir, rel) => {
+    let ents = []
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }) } catch (e) { return }
+    for (const e of ents) {
+      const childRel = rel ? rel + '/' + e.name : e.name
+      if (e.isDirectory()) {
+        if (BACKUP_SKIP.has(e.name) || e.name.startsWith('.')) continue
+        walk(path.join(dir, e.name), childRel)
+      } else if (e.isFile()) {
+        const parts = childRel.split('/')
+        if (parts.slice(0, -1).some(s => s.startsWith('.'))) continue
+        if (e.name.startsWith('.') && !BACKUP_ALLOW_DOT.has(e.name)) continue
+        try { entries.push({ name: childRel, data: fs.readFileSync(path.join(dir, e.name)) }) } catch (err) {}
+      }
+    }
+  }
+  walk(root, '')
+  return entries
+}
 
 app.get('/api/dev/export', devGate, (req, res) => {
-  const cp = spawn('python3', [path.join(ZIPTOOLS_DIR, 'export.py'), PROJECT_ROOT])
-  const date = new Date().toISOString().slice(0, 10)
-  res.writeHead(200, {
-    'Content-Type': 'application/zip',
-    'Content-Disposition': 'attachment; filename="seopro-full-backup-' + date + '.zip"',
-    'Cache-Control': 'no-store'
-  })
-  cp.stdout.pipe(res)
-  cp.on('error', () => {
-    if (!res.headersSent) res.status(500).json({ status: 'Error', error: 'python3 is required on the server for backups', compliance })
-  })
-  cp.on('close', () => res.end())
+  try {
+    const entries = collectBackupEntries(PROJECT_ROOT)
+    const zip = createZip(entries)
+    const date = new Date().toISOString().slice(0, 10)
+    res.writeHead(200, {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': 'attachment; filename="seopro-full-backup-' + date + '.zip"',
+      'Content-Length': String(zip.length),
+      'Cache-Control': 'no-store'
+    })
+    res.end(zip)
+  } catch (e) {
+    res.status(500).json({ status: 'Error', error: 'Export failed: ' + (e.message || e), compliance })
+  }
 })
 
 app.post('/api/dev/import', devGate, (req, res) => {
@@ -1900,36 +1925,48 @@ app.post('/api/dev/import', devGate, (req, res) => {
     if (aborted) return
     const buf = Buffer.concat(chunks)
     if (!buf.length) return res.status(400).json({ status: 'Error', error: 'Empty upload. Select a .zip backup file.', compliance })
-    const cp = spawn('python3', [path.join(ZIPTOOLS_DIR, 'import.py'), PROJECT_ROOT])
-    let out = ''
-    let errs = ''
-    cp.stdout.on('data', d => { out += d })
-    cp.stderr.on('data', d => { errs += d })
-    cp.on('error', () => {
-      res.status(500).json({ status: 'Error', error: 'python3 is required on the server for imports', compliance })
-    })
-    cp.on('close', code => {
-      if (code !== 0) {
-        return res.status(400).json({ status: 'Error', error: (errs || out || 'Import failed').trim().slice(0, 500), compliance })
+
+    let parsed
+    try { parsed = readZip(buf) } catch (e) {
+      return res.status(400).json({ status: 'Error', error: 'Not a valid .zip backup: ' + (e.message || e), compliance })
+    }
+
+    const rootAbs = path.resolve(PROJECT_ROOT)
+    const written = []
+    const skipped = []
+    try {
+      for (const entry of parsed) {
+        const n = String(entry.name || '').replace(/\\/g, '/')
+        const parts = n.split('/').filter(x => x && x !== '.')
+        if (!parts.length) continue
+        if (n.startsWith('/') || parts.includes('..')) { skipped.push(n); continue }
+        const fname = parts[parts.length - 1]
+        if (fname.startsWith('.') && !BACKUP_ALLOW_DOT.has(fname)) { skipped.push(n); continue }
+        if (parts.some(p => BACKUP_SKIP.has(p)) || parts.slice(0, -1).some(p => p.startsWith('.'))) { skipped.push(n); continue }
+        const dest = path.resolve(path.join(rootAbs, ...parts))
+        if (dest !== rootAbs && !dest.startsWith(rootAbs + path.sep)) { skipped.push(n); continue }
+        fs.mkdirSync(path.dirname(dest), { recursive: true })
+        fs.writeFileSync(dest, entry.data)
+        written.push(n)
       }
-      try {
-        const parsed = JSON.parse(out)
-        res.json({
-          status: 'Real',
-          written: parsed.written,
-          skipped: parsed.skipped,
-          writtenFiles: parsed.writtenFiles || [],
-          skippedFiles: parsed.skippedFiles || [],
-          notice: 'Backup restored. server.js/backend changes need a backend restart to take effect.',
-          compliance
-        })
-      } catch (e) {
-        res.status(500).json({ status: 'Error', error: 'Import output could not be parsed', compliance })
-      }
+    } catch (e) {
+      const readOnly = process.env.VERCEL || e.code === 'EROFS' || e.code === 'EACCES' || e.code === 'EPERM'
+      return res.status(500).json({
+        status: 'Error',
+        error: 'Import failed: ' + (e.message || e) + (readOnly ? ' - serverless deployments have a read-only filesystem, so restore the backup locally (then deploy) or use the dev backend on your machine.' : ''),
+        compliance
+      })
+    }
+
+    res.json({
+      status: 'Real',
+      written: written.length,
+      skipped: skipped.length,
+      writtenFiles: written.slice(0, 20),
+      skippedFiles: skipped.slice(0, 20),
+      notice: 'Backup restored. server.js/backend changes need a backend restart to take effect.',
+      compliance
     })
-    cp.stdin.on('error', () => {})
-    cp.stdin.write(buf)
-    cp.stdin.end()
   })
   req.on('error', () => {})
 })
