@@ -1790,7 +1790,7 @@ function devHandoffBrief(files, endpoints, gmailConfigured) {
     'OTP delivery: email SMTP configured (Gmail). Real sending needs a Google App Password in SMTP_PASS - until then codes show in a labelled "Demo inbox".',
     'Server-side .env keys (names only, values never in code): SERPAPI_API_KEY, PAGESPEED_API_KEY, GEMINI_API_KEY(model ' + (process.env.GEMINI_MODEL || 'default') + '), SMTP_*.',
     'Dev console APIs (/api/dev/*) are owner-gated: they require header x-dev-key = DEV_KEY from backend/.env.',
-    'Backup (/api/dev/export) ships full source + config (.env, .gitignore) but excludes node_modules/.git; import restores the same. node_modules comes back with: cd backend && npm ci.',
+    'Backup (/api/dev/export) ships the complete project, byte-for-byte: all source, config, .env variants, .gitignore/.vercelignore and .github. Only node_modules/.git/dist and local caches are excluded because they are regenerated (npm ci && npm run build). Import restores the exact same tree.',
     'Preview: dev-server.js on :8000 proxies /api/* to backend :4000.',
     'Development agent: continue the build in MonkeyCode-AI at https://monkeycode-ai.net with this brief.'
   ].join('\n')
@@ -1865,7 +1865,15 @@ app.get('/api/dev/file', devGate, (req, res) => {
 
 // ---------------------------------------------------------------- backup export / import
 const BACKUP_SKIP = new Set(['node_modules', '.git', '.monkeycode-tmp-files', 'dist', '.cache', '__pycache__', '.venv', 'coverage', '.vercel', '.v8-cache', '___vc', '.next'])
-const BACKUP_ALLOW_DOT = new Set(['.env', '.gitignore', '.vercelignore'])
+// Dot-directories that ARE part of the project and must be backed up.
+const BACKUP_ALLOW_DOT_DIRS = new Set(['.github', '.well-known'])
+// Allowed dotfiles: any .env variant (.env, .env.local, .env.production,
+// .env.example, ...), plus the ignore files. Everything else dot-prefixed is
+// treated as local tooling (e.g. .opencode) and skipped.
+const BACKUP_DOT_FILE_RE = /^\.env(\..+)?$/
+function isAllowedDotFile(name) {
+  return name === '.gitignore' || name === '.vercelignore' || BACKUP_DOT_FILE_RE.test(name)
+}
 // Env vars copied into a generated .env inside the backup when
 // BACKUP_INCLUDE_ENV=1 (owner opt-in). Default is OFF so secrets are never
 // shipped from a hosted deployment unless you explicitly ask for it.
@@ -1899,12 +1907,15 @@ function collectBackupEntries(root) {
     for (const e of ents) {
       const childRel = rel ? rel + '/' + e.name : e.name
       if (e.isDirectory()) {
-        if (BACKUP_SKIP.has(e.name) || e.name.startsWith('.')) continue
+        if (BACKUP_SKIP.has(e.name)) continue
+        if (e.name.startsWith('.') && !BACKUP_ALLOW_DOT_DIRS.has(e.name)) continue
         walk(path.join(dir, e.name), childRel)
       } else if (e.isFile()) {
         const parts = childRel.split('/')
-        if (parts.slice(0, -1).some(s => s.startsWith('.'))) continue
-        if (e.name.startsWith('.') && !BACKUP_ALLOW_DOT.has(e.name)) continue
+        const dirs = parts.slice(0, -1)
+        if (dirs.some(s => BACKUP_SKIP.has(s))) continue
+        if (dirs.some(s => s.startsWith('.') && !BACKUP_ALLOW_DOT_DIRS.has(s))) continue
+        if (e.name.startsWith('.') && !isAllowedDotFile(e.name)) continue
         try { entries.push({ name: childRel, data: fs.readFileSync(path.join(dir, e.name)) }) } catch (err) {}
       }
     }
@@ -1978,8 +1989,10 @@ app.post('/api/dev/import', devGate, (req, res) => {
         if (!parts.length) continue
         if (n.startsWith('/') || parts.includes('..')) { skipped.push(n); continue }
         const fname = parts[parts.length - 1]
-        if (fname.startsWith('.') && !BACKUP_ALLOW_DOT.has(fname)) { skipped.push(n); continue }
-        if (parts.some(p => BACKUP_SKIP.has(p)) || parts.slice(0, -1).some(p => p.startsWith('.'))) { skipped.push(n); continue }
+        const dirs = parts.slice(0, -1)
+        if (parts.some(p => BACKUP_SKIP.has(p))) { skipped.push(n); continue }
+        if (dirs.some(p => p.startsWith('.') && !BACKUP_ALLOW_DOT_DIRS.has(p))) { skipped.push(n); continue }
+        if (fname.startsWith('.') && !isAllowedDotFile(fname)) { skipped.push(n); continue }
         const dest = path.resolve(path.join(rootAbs, ...parts))
         if (dest !== rootAbs && !dest.startsWith(rootAbs + path.sep)) { skipped.push(n); continue }
         fs.mkdirSync(path.dirname(dest), { recursive: true })

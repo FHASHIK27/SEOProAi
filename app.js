@@ -2423,13 +2423,13 @@ function devAdminContent() {
     '<div class="mt-16 flex" style="align-items:center;flex-wrap:wrap;gap:8px"><span class="muted small">Live API keys:</span><span id="devKeyChips" class="dev-chips"></span></div>' +
 
     '<div class="form-card mt-24">' +
-      devStep(3, 'Backup - export / import', 'যেকোনো সময় পুরো ওয়েবসাইটের সব কোড ফাইল একসাথে .zip আকারে export (backup) করে রাখতে পারবেন, এবং চাইলে আগের backup ইমপোর্ট করে রিস্টোর করতে পারবেন। এক্সপোর্টে সব প্রকল্প ফাইল/ফোল্ডার + কনফিগ (.env, .gitignore) থাকে — শুধু node_modules/.git বাদ (install হলে npm ci দিয়ে আবার বসে)। .env-এ keys থাকায় এই API owner key দিয়ে সুরক্ষিত।') +
+      devStep(3, 'Backup - export / import (100% complete)', 'যেকোনো সময় পুরো ওয়েবসাইটের সব ফাইল হুবহু .zip আকারে export (backup) করে রাখতে পারবেন, আর আগের backup import করলে ওয়েবসাইট হুবহু ফিরে আসবে। এক্সপোর্টে প্রকল্পের প্রতিটি ফাইল/ফোল্ডার থাকে — কোড, কনফিগ, .env (সব .env variant), .gitignore/.vercelignore, .github — সব কিছু। শুধু যা বাদ যাবে: node_modules, .git, dist (এগুলো npm ci আর build দিয়ে হুবহু আবার তৈরি হয়), এবং .vercel/ক্যাশ। তাই অন্য জায়গায় নিলেও পুরো সাইট চলে। .env-এ keys থাকায় এই API owner key দিয়ে সুরক্ষিত।') +
       '<div class="flex mt-16" style="flex-wrap:wrap;gap:10px;align-items:center">' +
         '<button class="btn btn-primary" id="devExportBtn" type="button">Export full backup (.zip)</button>' +
         '<label class="btn btn-ghost" style="margin:0;cursor:pointer">Import backup (.zip)<input type="file" id="devImportFile" accept=".zip,application/zip" style="display:none"></label>' +
         '<button class="btn btn-ghost btn-sm" id="devTreeRefreshCode" type="button">Refresh file list</button>' +
       '</div>' +
-      '<div class="muted small mt-8" id="devImportStatus">Import করলে একই নামের ফাইলগুলো (এমনকি .env/.gitignore-ও) ওভাররাইট হবে। node_modules/.git বাদ যাবে। .env বদলালে backend restart করতে হবে।</div>' +
+      '<div class="muted small mt-8" id="devImportStatus">Import করলে একই নামের ফাইলগুলো (এমনকি .env/.gitignore/.env.local-ও) ওভাররাইট হবে — অর্থাৎ হুবহু রিস্টোর। node_modules/.git/dist বাদ যাবে (ওগুলো npm ci && build দিয়ে হুবহু ফিরে আসে)। .env বদলালে backend restart করতে হবে।</div>' +
     '</div>' +
 
     '<div class="form-card mt-24">' +
