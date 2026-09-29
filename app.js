@@ -344,7 +344,50 @@ function fetchTimeout(url, opts = {}, ms = 20000) {
   return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t))
 }
 
-function devStoredKey() { try { return localStorage.getItem('seoproDevKey') || '' } catch (e) { return '' } }
+/* Owner-key dev session: kept ONLY in memory (never localStorage), valid for a
+   maximum of 6 hours, and cleared the moment the Dev console is left or the
+   page is reloaded. So every fresh entry requires the owner key again. */
+const DEV_SESSION_MS = 6 * 60 * 60 * 1000
+let devSession = { key: '', exp: 0 }
+let devViewActive = false
+let devLockTimer = null
+
+function devLockNow() {
+  devSession = { key: '', exp: 0 }
+  if (devLockTimer) { clearTimeout(devLockTimer); devLockTimer = null }
+}
+
+function devUnlock(key) {
+  devSession = { key: String(key || ''), exp: Date.now() + DEV_SESSION_MS }
+  if (devLockTimer) clearTimeout(devLockTimer)
+  devLockTimer = setTimeout(devSessionExpired, DEV_SESSION_MS)
+}
+
+function devSessionExpired() {
+  devLockNow()
+  if (!devViewActive) return
+  const lockBox = document.getElementById('devLock')
+  const wrap = document.getElementById('devWrap')
+  if (lockBox) lockBox.style.display = ''
+  if (wrap) wrap.style.display = 'none'
+  const msg = document.getElementById('devKeyMsg')
+  if (msg) msg.textContent = 'Session sesh (6 ghonta) - abar owner key din.'
+  const k = document.getElementById('devKeyInput')
+  if (k) { k.value = ''; k.focus() }
+}
+
+function devStoredKey() {
+  if (!devSession.key) return ''
+  if (Date.now() >= devSession.exp) { devLockNow(); return '' }
+  return devSession.key
+}
+
+function devSessionLabel() {
+  const ms = devSession.exp - Date.now()
+  if (!devSession.key || ms <= 0) return 'locked'
+  const m = Math.max(1, Math.round(ms / 60000))
+  return 'unlocked - ' + (m >= 60 ? Math.round(m / 60) + 'h ' + (m % 60) + 'm' : m + 'm') + ' left (locks on exit)'
+}
 
 async function parseApiResponse(r) {
   const text = await r.text()
@@ -951,8 +994,11 @@ function navigate() {
     return
   }
   const fn = views[path] || views['/']
+  const onDev = path === '/admin' && state.adminTab === 'dev'
+  if (!onDev && devViewActive) devLockNow()
   view.innerHTML = fn()
   bindView(path, view)
+  devViewActive = onDev
   window.scrollTo({ top: 0 })
   updateAuthUI()
   markActiveLink(path)
@@ -2334,7 +2380,7 @@ function devAdminContent() {
       '<div class="flex" style="gap:14px;align-items:flex-start">' +
         '<div class="dev-step-no">K</div>' +
         '<div><h4 style="margin:0">Owner key required</h4>' +
-        '<p class="muted small" style="margin:6px 0 0;max-width:760px">এই Dev Console-এর API (কোড দেখা, backup export/import — যেটাতে এখন <code>.env</code> কনফিগও থাকে) শুধু owner-এর জন্য লক করা। <b>backend/.env</b> ফাইলে <code>DEV_KEY=...</code> লাইনে যে key আছে, সেটাই নিচে দিন। একবার দিলে এই ব্রাউজারে সেভ থাকবে।</p></div>' +
+        '<p class="muted small" style="margin:6px 0 0;max-width:760px">এই Dev Console-এর API (কোড দেখা, backup export/import — যেটাতে এখন <code>.env</code> কনফিগও থাকে) শুধু owner-এর জন্য লক করা। <b>backend/.env</b> ফাইলে <code>DEV_KEY=...</code> লাইনে যে key আছে, সেটাই নিচে দিন। key দিলে সর্বোচ্চ <b>৬ ঘণ্টা</b> খোলা থাকবে; Dev Console থেকে বের হওয়া মাত্রই (বা পেজ reload/বন্ধ করলেই) আবার সাথে সাথে লক হয়ে যাবে এবং নতুন করে ঢুকতে আবার owner key দিতে হবে। key কোথাও সেভ হয় না — শুধু মেমোরিতে থাকে।</p></div>' +
       '</div>' +
       '<div class="input-row mt-16" style="max-width:640px"><input type="password" id="devKeyInput" placeholder="Owner key (DEV_KEY from backend/.env)" autocomplete="off"><button class="btn btn-primary" id="devKeyUnlock" type="button">Unlock</button></div>' +
       '<div class="muted small mt-8" id="devKeyMsg"></div>' +
@@ -2347,7 +2393,11 @@ function devAdminContent() {
           '<h3 style="margin:6px 0 0">MonkeyCode-AI - Site Development</h3>' +
           '<p class="muted small mt-8">আপনার সাইট ডেভেলপমেন্ট এজেন্ট হলো <b>MonkeyCode-AI</b> (Gemini নয়)। নিচের ধাপগুলো অনুসরণ করলে যেকোনো ডেভেলপমেন্ট কাজ MonkeyCode-AI-তে শুরু করা যাবে। এই পেজের সব তথ্য আসল, লাইভ কোড থেকে আসে।</p>' +
         '</div>' +
-        '<button class="btn btn-primary" id="devOpenBtn" type="button">Open MonkeyCode-AI</button>' +
+        '<div class="flex" style="gap:8px;flex-wrap:wrap;align-items:center">' +
+          '<span class="label-pill label-good" id="devSessionPill">unlocked</span>' +
+          '<button class="btn btn-primary" id="devOpenBtn" type="button">Open MonkeyCode-AI</button>' +
+          '<button class="btn btn-ghost" id="devLockBtn" type="button">Lock now</button>' +
+        '</div>' +
       '</div>' +
       '<div id="devError" class="alert alert-error" style="display:none"></div>' +
     '</div>' +
@@ -2457,11 +2507,11 @@ async function devTryUnlock() {
   const msg = document.getElementById('devKeyMsg')
   const v = (input && input.value ? input.value : '').trim()
   if (!v) { if (msg) msg.textContent = 'Owner key ta likhun.'; return }
-  localStorage.setItem('seoproDevKey', v)
+  devUnlock(v)
   if (msg) msg.textContent = 'Checking key...'
   const d = await apiGet('/api/dev/project', 10000)
   if (!d || d.status !== 'Real') {
-    localStorage.removeItem('seoproDevKey')
+    devLockNow()
     if (msg) msg.textContent = (d && d.error) ? d.error : 'Key verify hoyni (backend offline?)'
     return
   }
@@ -2496,6 +2546,10 @@ async function devLoadProject(onLocked) {
       window.open(/^https:\/\//i.test(target) ? target : 'https://monkeycode-ai.net', '_blank', 'noopener')
     })
   }
+  const lockBtn = document.getElementById('devLockBtn')
+  if (lockBtn) lockBtn.addEventListener('click', () => { devLockNow(); navigate() })
+  const sessionPill = document.getElementById('devSessionPill')
+  if (sessionPill) sessionPill.textContent = devSessionLabel()
 
   const copyBtn = document.getElementById('devCopyBrief')
   const copyTaskBtn = document.getElementById('devCopyTask')
@@ -2556,7 +2610,7 @@ async function devLoadProject(onLocked) {
 
   const data = await apiGet('/api/dev/project', 15000)
   if (data && data.locked) {
-    localStorage.removeItem('seoproDevKey')
+    devLockNow()
     if (typeof onLocked === 'function') onLocked(data.error || 'Owner key required.')
     return
   }

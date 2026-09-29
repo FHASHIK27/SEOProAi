@@ -6,6 +6,7 @@ import fs from 'fs'
 import path from 'path'
 import dns from 'node:dns/promises'
 import { createZip, readZip } from './ziptools/zip.js'
+import { GITIGNORE, VERCELIGNORE } from './ziptools/dotfile-templates.js'
 
 dotenv.config()
 
@@ -1864,7 +1865,7 @@ app.get('/api/dev/file', devGate, (req, res) => {
 
 // ---------------------------------------------------------------- backup export / import
 const BACKUP_SKIP = new Set(['node_modules', '.git', '.monkeycode-tmp-files', 'dist', '.cache', '__pycache__', '.venv', 'coverage', '.vercel', '.v8-cache', '___vc', '.next'])
-const BACKUP_ALLOW_DOT = new Set(['.env', '.gitignore'])
+const BACKUP_ALLOW_DOT = new Set(['.env', '.gitignore', '.vercelignore'])
 // Env vars copied into a generated .env inside the backup when
 // BACKUP_INCLUDE_ENV=1 (owner opt-in). Default is OFF so secrets are never
 // shipped from a hosted deployment unless you explicitly ask for it.
@@ -1918,6 +1919,14 @@ app.get('/api/dev/export', devGate, (req, res) => {
     const hasEnv = entries.some(e => e.name === '.env' || e.name === 'backend/.env')
     if (!hasEnv && process.env.BACKUP_INCLUDE_ENV === '1') {
       entries.push({ name: '.env', data: Buffer.from(buildEnvFile()) })
+    }
+    // Vercel does not reliably bundle root dotfiles into the function, so add
+    // the real .gitignore/.vercelignore from bundled templates when missing.
+    if (!entries.some(e => e.name === '.gitignore')) {
+      entries.push({ name: '.gitignore', data: Buffer.from(GITIGNORE) })
+    }
+    if (!entries.some(e => e.name === '.vercelignore')) {
+      entries.push({ name: '.vercelignore', data: Buffer.from(VERCELIGNORE) })
     }
     const zip = createZip(entries)
     const date = new Date().toISOString().slice(0, 10)
