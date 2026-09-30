@@ -32,11 +32,14 @@ function absUrl(p) {
 
 // Search Console / Bing verification codes (set as env vars on the host).
 // Build-time only: no runtime cost, and empty values are simply omitted.
+// Accept multiple Google verification tokens (comma or space separated) so a
+// re-added property with a fresh token keeps working alongside the old one.
 const GOOGLE_VERIFY = (process.env.GOOGLE_SITE_VERIFICATION || '').trim()
+const GOOGLE_VERIFY_LIST = GOOGLE_VERIFY.split(/[,\s]+/).map(s => s.trim()).filter(Boolean)
 const BING_VERIFY = (process.env.BING_SITE_VERIFICATION || '').trim()
 function verificationMeta() {
   const tags = []
-  if (GOOGLE_VERIFY) tags.push('<meta name="google-site-verification" content="' + GOOGLE_VERIFY + '">')
+  for (const t of GOOGLE_VERIFY_LIST) tags.push('<meta name="google-site-verification" content="' + t + '">')
   if (BING_VERIFY) tags.push('<meta name="msvalidate.01" content="' + BING_VERIFY + '">')
   return tags.join('\n')
 }
@@ -567,6 +570,13 @@ if (fs.existsSync(path.join(ROOT, 'og-image.png'))) {
 }
 if (fs.existsSync(path.join(ROOT, 'og-image.svg'))) {
   fs.copyFileSync(path.join(ROOT, 'og-image.svg'), path.join(DIST, 'og-image.svg'))
+}
+// Google (and other) site-verification HTML files at the repo root are copied
+// verbatim into dist so /googleXXXX.html resolves on the deployed site.
+for (const f of fs.readdirSync(ROOT)) {
+  if (/^google[a-z0-9]+\.html$/i.test(f)) {
+    fs.copyFileSync(path.join(ROOT, f), path.join(DIST, f))
+  }
 }
 
 console.log('Public origin: ' + (SITE_ORIGIN || '(placeholder - set SITE_URL on your host)'))
