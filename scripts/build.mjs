@@ -412,6 +412,17 @@ const sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n' +
   '</urlset>\n'
 write('sitemap.xml', withSite(sitemap))
 
+// Minimal, maximally-compatible sitemap (no hreflang xhtml:link). Some search
+// engine parsers (notably a few Bing UI paths) reject the xhtml:link form, so
+// this plain version is offered as a fallback at /sitemap-basic.xml.
+const sitemapBasic = '<?xml version="1.0" encoding="UTF-8"?>\n' +
+  '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
+  [...SPA_PAGES, ...STATIC_PAGES].map(p =>
+    '  <url>\n    <loc>' + absUrl(p.path) + '</loc>\n    <lastmod>' + (p.updated || BUILD_DATE) + '</lastmod>\n  </url>'
+  ).join('\n') + '\n' +
+  '</urlset>\n'
+write('sitemap-basic.xml', withSite(sitemapBasic))
+
 // ---- RSS feed for guides/articles ----
 const feedItems = STATIC_PAGES.filter(p => p.type === 'article').map(p => {
   const url = absUrl(p.path)
